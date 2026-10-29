@@ -1,7 +1,33 @@
+# Dockerfile.web — CodeNexus AI Web Gateway
+# Builds a small, non-root container running the web gateway on port 9000.
+# No .env, API keys, or secrets are copied; all configuration is supplied at runtime.
+
 FROM python:3.11-slim
+
 WORKDIR /app
+
+# Install runtime dependencies (web service needs its own module plus agents).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+
+# Copy only the application files needed to run the gateway.
+COPY web_server.py .
+COPY agents.py .
+COPY static ./static
+COPY templates ./templates
+
+# Run as a non-root user for defence in depth.
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+USER appuser
+
+# Web gateway listens on 9000 inside the container.
 EXPOSE 9000
-CMD ["python3", "web_server.py"]
+
+# Health check: hit the web /health endpoint on localhost.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health').read()" || exit 1
+
+# Start uvicorn bound to all interfaces so Compose service-name DNS works.
+CMD ["uvicorn", "web_server:app", "--host", "0.0.0.0", "--port", "9000"]

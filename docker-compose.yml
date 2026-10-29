@@ -1,19 +1,41 @@
-
 services:
   mcp-server:
-    build: .
-    command: uvicorn mcp_server:app --host 0.0.0.0 --port 8000
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    # MCP_BASE is not required by the MCP service itself; it is provided here
+    # only for documentation/debugging. No secrets are mounted.
+    environment:
+      - MCP_BASE=http://0.0.0.0:8000
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   web-server:
-    build: .
-    command: uvicorn web_server:app --host 0.0.0.0 --port 8001
+    build:
+      context: .
+      dockerfile: Dockerfile.web
     ports:
-      - "8001:8001"
-    env_file:
-      - .env
+      - "9000:9000"
+    environment:
+      # Reach MCP through Compose service-name DNS, not 127.0.0.1.
+      - MCP_BASE=http://mcp-server:8000
+      # Stub mode by default: no live LLM calls, no API keys required.
+      - LLM_STUB=1
+      - LLM_ENABLED=0
+      - MCP_TIMEOUT=5.0
+      - QUARANTINE_PATH=/app/logs/quarantine.jsonl
     depends_on:
-      - mcp-server
+      mcp-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

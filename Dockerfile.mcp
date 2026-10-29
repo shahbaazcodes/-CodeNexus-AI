@@ -1,7 +1,30 @@
+# Dockerfile.mcp — CodeNexus AI MCP Core Engine
+# Builds a small, non-root container running only the MCP service on port 8000.
+# No .env or secrets are copied; all configuration is supplied at runtime.
+
 FROM python:3.11-slim
+
 WORKDIR /app
+
+# Install runtime dependencies (MCP service only needs its own module).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy only the MCP server module — nothing else.
 COPY mcp_server.py .
+
+# Run as a non-root user for defence in depth.
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+USER appuser
+
+# MCP service listens on 8000 inside the container.
 EXPOSE 8000
-CMD ["python3", "mcp_server.py"]
+
+# Health check: hit the MCP /health endpoint on localhost.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()" || exit 1
+
+# Start uvicorn bound to all interfaces so Compose service-name DNS works.
+CMD ["uvicorn", "mcp_server:app", "--host", "0.0.0.0", "--port", "8000"]
