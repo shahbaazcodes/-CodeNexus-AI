@@ -1,0 +1,39 @@
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs and local data
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated project dumps — review before publishing
+all_project_code.txt
+export_all_code.txt
+codebase_dump.txt
+
+# Local tooling and operating system
+.DS_Store
+.vscode/
+
+# Sensitive credentials and certificates
+credentials.json
+secrets.json
+*.pem
+*.key

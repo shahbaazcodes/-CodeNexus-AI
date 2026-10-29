@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CodeNexus AI — Enterprise Portfolio</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🤖</span>
+                <h1>CodeNexus AI</h1>
+            </div>
+            <p class="subtitle">Multi-Agent AI Code Analysis Engine &amp; Code Quality Classifier</p>
+        </header>
+        <main class="main-grid">
+            <section class="card">
+                <div class="card-header">
+                    <span class="card-title">SOURCE CODE EDITOR</span>
+                    <select id="language" class="lang-select">
+                        <option value="python">Python</option>
+                        <option value="java">Java</option>
+                        <option value="cpp">C++</option>
+                        <option value="javascript">JavaScript</option>
+                        <option value="typescript">TypeScript</option>
+                    </select>
+                </div>
+                <div class="editor-wrapper">
+                    <textarea id="content" placeholder="# Paste your source code snippet here..." spellcheck="false">def process_user_data(users, active_only=True, default_roles=None):
+    if default_roles is None:
+        default_roles = []
+    results = {}
+    for user in users:
+        if active_only and user.get('status') != 'active':
+            continue
+        user_id = user.get('id')
+        roles = list(user.get('roles', default_roles))
+        roles.append('guest')
+        results[user_id] = roles
+    return results</textarea>
+                </div>
+                <div class="card-footer">
+                    <button id="analyze-btn" class="btn-primary" onclick="analyzeCode()">
+                        <span>⚡ Initiate Analysis</span>
+                    </button>
+                    <button id="export-btn" class="btn-secondary" onclick="downloadReport()">
+                        <span>📄 Export MD</span>
+                    </button>
+                </div>
+            </section>
+            <section class="card">
+                <div class="card-header">
+                    <div class="tabs">
+                        <button id="tab-btn-review" class="tab-btn active" onclick="switchTab('review')">🔍 Review</button>
+                        <button id="tab-btn-bugs" class="tab-btn" onclick="switchTab('bugs')">✳ Bugs</button>
+                        <button id="tab-btn-refactor" class="tab-btn" onclick="switchTab('refactor')">⚡ Fix</button>
+                        <button id="tab-btn-docs" class="tab-btn" onclick="switchTab('docs')">📄 Docs</button>
+                    </div>
+                    <div class="health-badge">
+                        <span id="health-score-pill">Score: --</span>
+                        <span id="risk-badge">Risk: --</span>
+                    </div>
+                </div>
+                <div class="output-wrapper">
+                    <div id="tab-review" class="tab-pane active">
+                        <div id="loader-review" class="loading-overlay hidden">
+                            <div class="circular-loader"></div>
+                            <p class="loader-text">Analyzing Code &amp; Architecture...</p>
+                        </div>
+                        <pre id="review-output" class="placeholder-text">Click "⚡ Initiate Analysis" to trigger multi-agent inspection...</pre>
+                    </div>
+                    <div id="tab-bugs" class="tab-pane">
+                        <div id="loader-bugs" class="loading-overlay hidden">
+                            <div class="circular-loader"></div>
+                            <p class="loader-text">Hunting Bugs &amp; Vulnerabilities...</p>
+                        </div>
+                        <pre id="bugs-output" class="placeholder-text">Bug analysis results will appear here...</pre>
+                    </div>
+                    <div id="tab-refactor" class="tab-pane">
+                        <div id="loader-refactor" class="loading-overlay hidden">
+                            <div class="circular-loader"></div>
+                            <p class="loader-text">Refactoring Code Structure...</p>
+                        </div>
+                        <pre id="refactor-output" class="code-output">Refactored code will appear here...</pre>
+                    </div>
+                    <div id="tab-docs" class="tab-pane">
+                        <div id="loader-docs" class="loading-overlay hidden">
+                            <div class="circular-loader"></div>
+                            <p class="loader-text">Generating Inline Documentation...</p>
+                        </div>
+                        <pre id="docs-output" class="code-output">Documentation will appear here...</pre>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
