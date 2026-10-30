@@ -3,7 +3,7 @@
 import json
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__) or ".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import eval.run_eval as re
 class TestDatasetSchema:
     """Test that the cases.json dataset conforms to the expected Phase 5 schema."""

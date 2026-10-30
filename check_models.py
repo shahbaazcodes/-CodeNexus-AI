@@ -10,7 +10,8 @@ load_dotenv()  # Do not override environment variables already set by the shell.
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 MCP_BASE = os.getenv("MCP_BASE", "http://127.0.0.1:8000").rstrip("/")
 
@@ -60,6 +61,40 @@ async def test_gemini(client: httpx.AsyncClient) -> str:
         return "PASS"
     result = classify_error(response.status_code)
     print(f"{result}: Gemini returned HTTP {response.status_code}")
+    return result
+
+
+async def test_gemini_fallback(client: httpx.AsyncClient) -> str:
+    print(f"Testing Gemini fallback model: {GEMINI_FALLBACK_MODEL}")
+    if not GEMINI_API_KEY:
+        print("SKIPPED: GEMINI_API_KEY is not configured")
+        return "SKIPPED"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_FALLBACK_MODEL}:generateContent"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": "Reply with OK."}]}],
+        "generationConfig": {"maxOutputTokens": 5, "temperature": 0},
+    }
+    try:
+        response = await client.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json=payload,
+            timeout=10.0,
+        )
+    except httpx.TimeoutException:
+        print("NETWORK_ERROR: Gemini fallback request timed out")
+        return "NETWORK_ERROR"
+    except httpx.HTTPError as exc:
+        print(f"NETWORK_ERROR: Gemini fallback request failed ({type(exc).__name__})")
+        return "NETWORK_ERROR"
+    if response.is_success:
+        print("PASS: Gemini fallback returned a successful response")
+        return "PASS"
+    result = classify_error(response.status_code)
+    print(f"{result}: Gemini fallback returned HTTP {response.status_code}")
     return result
 
 
@@ -126,6 +161,7 @@ async def main() -> None:
     async with httpx.AsyncClient() as client:
         results = {
             "Gemini primary": await test_gemini(client),
+            "Gemini fallback": await test_gemini_fallback(client),
             "Groq fallback": await test_groq(client),
             "MCP health": await test_mcp(client),
         }
