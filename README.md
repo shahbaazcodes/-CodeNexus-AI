@@ -2,7 +2,7 @@
 
 **A Multi-Agent System for Automated Code Analysis, Debugging, and Refactoring.**
 
-Powered by **Model Context Protocol (MCP)**, **Google Gemini 2.5**, and **FastAPI**.
+Powered by **Model Context Protocol (MCP)**, **Google Gemini**, and **FastAPI**.
 
 ---
 
@@ -20,7 +20,7 @@ This project allows developers to upload Python code and receive instant, profes
 ## ⚙️ Tech Stack
 * **Backend:** Python 3.12+, FastAPI (Async Web Server)
 * **Frontend:** HTML5, CSS3 (Dark Mode), Vanilla JS
-* **AI Model:** Google Gemini 2.5 Flash (via Google Generative AI API)
+* **AI Model:** Google Gemini (configurable via `GEMINI_MODEL`, defaults to `gemini-3.8-flash`)
 * **Architecture:** Client-Server (MCP Pattern)
 * **Security:** Environment Variable Management (`python-dotenv`) for API Keys
 
