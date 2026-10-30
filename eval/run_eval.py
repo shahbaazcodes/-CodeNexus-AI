@@ -11,9 +11,9 @@ CASE_SCHEMA = {
     "properties": {
         "id": {"type": "integer"},
         "filename": {"type": "string", "minLength": 1},
-        "language": {"type": "object", "enum": ["python", "javascript", "cpp", "c++", "java"]},
+        "language": {"type": "string", "enum": ["python", "javascript", "cpp", "c++", "java"]},
         "code": {"type": "string", "minLength": 1},
-        "category": {"type": "object", "enum": ["known_defect", "clean_code", "prompt_injection", "refactoring", "todo"]},
+        "category": {"type": "string", "enum": ["known_defect", "clean_code", "prompt_injection", "refactoring", "todo"]},
         "expected_findings": {"type": "array", "items": {"type": "object", "required": ["label", "severity", "description"], "properties": {"label": {"type": "string"}, "severity": {"type": "string"}, "description": {"type": "string"}}}},
     },
 }
