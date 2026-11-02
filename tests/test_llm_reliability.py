@@ -395,6 +395,115 @@ def test_shared_quota_limits_concurrency(monkeypatch, fake_client):
     assert all("ok" in r for r in results)
 
 
+# ── Requirement 14b: HTTP 429 with short Retry-After retries then succeeds ──
+def test_429_short_retry_after_retries_then_success(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    agents.quota_limiter.max_retries = 2
+    agents.gemini_circuit_breaker.cooldown = 0.0
+    # First attempt: 429 with short Retry-After; second: success.
+    resp = _FakeResponse(429)
+    resp.headers["retry-after"] = "0.01"
+    fake_client.responses = [resp, _make_gemini_response("recovered")]
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    gemini_calls = [c for c in fake_client.calls if _is_gemini_url(c[0])]
+    groq_calls = [c for c in fake_client.calls if _is_groq_url(c[0])]
+    assert result == "recovered", f"expected recovery, got {result!r}"
+    assert len(gemini_calls) == 2, "one retry then success"
+    assert len(groq_calls) == 0, "no Groq fallback when Gemini recovers"
+
+
+# ── Requirement 14c: HTTP 429 without Retry-After retries with backoff ──
+def test_429_no_retry_after_retries_with_backoff(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    agents.quota_limiter.max_retries = 1
+    agents.gemini_circuit_breaker.cooldown = 0.0
+    fake_client.responses = [_FakeResponse(429), _make_gemini_response("recovered")]
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    gemini_calls = [c for c in fake_client.calls if _is_gemini_url(c[0])]
+    assert result == "recovered"
+    assert len(gemini_calls) == 2, "429 without Retry-After still retries with backoff"
+
+
+# ── Requirement 14d: HTTP 429 with long Retry-After falls back to Groq immediately ──
+def test_429_long_retry_after_immediate_groq_fallback(monkeypatch, fake_client, monkeypatch_cb):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    agents.quota_limiter.max_retries = 2
+    agents.gemini_circuit_breaker.cooldown = 0.0
+    agents.GEMINI_MAX_RETRY_AFTER = 1.0  # short bound for test
+    # 429 with a Retry-After far exceeding the bound -> immediate Groq fallback.
+    resp = _FakeResponse(429)
+    resp.headers["retry-after"] = "60"
+    fake_client.responses = [resp, _make_groq_response("groq answer")]
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    gemini_calls = [c for c in fake_client.calls if _is_gemini_url(c[0])]
+    groq_calls = [c for c in fake_client.calls if _is_groq_url(c[0])]
+    assert result == "groq answer", f"expected Groq fallback, got {result!r}"
+    assert len(gemini_calls) == 1, "only one Gemini attempt (no retry on long Retry-After)"
+    assert len(groq_calls) == 1, "Groq fallback invoked"
+
+
+# ── Requirement 14e: Exception variable stays in scope (regression for indentation bug) ──
+def test_exception_variable_in_scope(monkeypatch, fake_client):
+    """The exception handler body must reference `e` inside `except` (not outside)."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False, groq_key="")
+    agents.quota_limiter.max_retries = 0
+    agents.gemini_circuit_breaker.cooldown = 0.0
+
+    async def raise_timeout(url, headers=None, json=None, timeout=None):
+        fake_client.calls.append((url, headers, json, timeout))
+        raise httpx.TimeoutException("read timed out")
+
+    orig = fake_client.post
+    fake_client.post = raise_timeout
+    try:
+        result = asyncio.run(agents.call_llm("review this code", "python"))
+    finally:
+        fake_client.post = orig
+
+    assert "Unavailable" in result, f"expected unavailable result, got {result!r}"
+    gemini_calls = [c for c in fake_client.calls if _is_gemini_url(c[0])]
+    assert len(gemini_calls) == 1, "single Gemini attempt on timeout"
+
+
+# ── Requirement 14f: Concurrent agents do not exceed configured quota limit ──
+def test_concurrent_agents_respect_quota_semaphore(monkeypatch, fake_client):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    agents.quota_limiter.max_rpm = 0
+    agents.quota_limiter.max_tpm = 0
+    agents.quota_limiter._semaphore = asyncio.Semaphore(agents.GEMINI_MAX_CONCURRENT_REQUESTS)
+
+    in_flight = 0
+    max_in_flight = 0
+    lock = asyncio.Lock()
+
+    async def slow_post(url, headers=None, json=None, timeout=None):
+        nonlocal in_flight, max_in_flight
+        async with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.02)
+        async with lock:
+            in_flight -= 1
+        return _FakeResponse(200, {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+
+    fake_client.calls = []
+    orig_post = fake_client.post
+    fake_client.post = slow_post
+
+    async def _run():
+        return await asyncio.gather(*[
+            agents.call_llm("review code", "python", agent=f"agent{i}")
+            for i in range(agents.GEMINI_MAX_CONCURRENT_REQUESTS * 2)
+        ])
+
+    results = asyncio.run(_run())
+    fake_client.post = orig_post
+
+    assert max_in_flight <= agents.GEMINI_MAX_CONCURRENT_REQUESTS, \
+        f"exceeded quota: {max_in_flight} in flight, limit {agents.GEMINI_MAX_CONCURRENT_REQUESTS}"
+    assert all("ok" in r for r in results)
+
+
 # ── Requirement 15: Timeout respected ──
 def test_timeout_respected(monkeypatch, fake_client):
     _set_llm_mode(monkeypatch, enabled=True, stub=False)

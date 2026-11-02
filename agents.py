@@ -24,8 +24,7 @@ LLM_ENABLED = os.getenv("LLM_ENABLED", "1").strip() == "1"
 LLM_STUB = os.getenv("LLM_STUB", "0").lower() == "1"
 
 # Model names configurable through environment variables
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Bounded retry configuration with exponential backoff
@@ -57,6 +56,11 @@ MAX_CONCURRENT_PROVIDER_REQUESTS = int(os.getenv("MAX_CONCURRENT_PROVIDER_REQUES
 # the process for a long time.
 GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "8.0"))
 GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "8.0"))
+
+# If a provider indicates a Retry-After window longer than this, do not wait;
+# fall back to Groq immediately instead of burning the retry budget on a long
+# rate-limit window. Preserves the per-call timeout as the natural bound.
+GEMINI_MAX_RETRY_AFTER = float(os.getenv("GEMINI_MAX_RETRY_AFTER", str(int(GEMINI_TIMEOUT))))
 
 # Output token limit per LLM response (0 = no limit).
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
@@ -429,6 +433,15 @@ async def call_gemini_raw(prompt: str, agent: str = "agent") -> Optional[str]:
         print(f"⚠️ [Gemini Budget] {agent}: request rejected ({verdict}), falling back.")
         return None
 
+    # Early-exit: if another agent already tripped the circuit breaker OPEN,
+    # skip the Gemini attempt entirely and fall straight back to Groq. This
+    # avoids duplicate 8s timeout waits from concurrent agents that were
+    # queued behind the shared quota semaphore.
+    if gemini_circuit_breaker.state == gemini_circuit_breaker.OPEN:
+        quota_limiter.release()
+        print(f"🔄 [Gemini CircuitBreaker] {agent}: circuit already OPEN, skipping Gemini and falling back to Groq.")
+        return None
+
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     if quota_limiter.max_output_tokens:
@@ -438,13 +451,39 @@ async def call_gemini_raw(prompt: str, agent: str = "agent") -> Optional[str]:
     last_status = None
     acquired = True
     timing = _Timing(agent=agent)
+    # Helper to sanitize exception/message for logging (no API keys, auth headers)
+    def _sanitize(text: str) -> str:
+        if not text:
+            return ""
+        # Remove potential API keys, auth headers, bearer tokens
+        import re
+        text = re.sub(r"(?i)(api[_-]?key|authorization|bearer|x-goog-api-key)\s*[:=]\s*\S+", r"\1=***", text)
+        text = re.sub(r"[A-Za-z0-9_\-]{20,}", "***", text)  # Long tokens
+        return text[:200]  # Cap length
+
     try:
-        for attempt in range(quota_limiter.max_retries + 1):
-            backoff = BASE_BACKOFF * (2 ** attempt)
-            try:
-                async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+        # Reuse a single HTTP client across all retry attempts so that
+        # keep-alive connections are not torn down and re-established on
+        # every retry. Creating a fresh AsyncClient per attempt forces a new
+        # TCP/TLS handshake each time, which needlessly extends failover
+        # latency when Gemini is slow or unhealthy.
+        async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+            for attempt in range(quota_limiter.max_retries + 1):
+                backoff = BASE_BACKOFF * (2 ** attempt)
+                try:
                     r = await client.post(url, headers=headers, json=payload)
                     last_status = r.status_code
+                    # Capture sanitized response body for observability
+                    try:
+                        _resp_text = r.text
+                        if _resp_text:
+                            last_status = r.status_code  # already set, kept for clarity
+                            # Store sanitized body for potential debug logging
+                            _sanitized_body = _sanitize(_resp_text)
+                        else:
+                            _sanitized_body = None
+                    except Exception:
+                        _sanitized_body = None
                     duration = time.perf_counter() - timing.start
                     timing.gemini_attempt(last_status, duration)
                     if r.status_code == 200:
@@ -464,6 +503,18 @@ async def call_gemini_raw(prompt: str, agent: str = "agent") -> Optional[str]:
                         # If the threshold is reached, the circuit opens and we
                         # stop retrying. Otherwise we may retry if budget remains.
                         retry_after = parse_retry_after(getattr(r, "headers", {}))
+                        # Honor provider retry guidance, but do not burn the full
+                        # retry budget on a long rate-limit window. When the
+                        # provider indicates a wait beyond our bound, fall back
+                        # to Groq immediately instead.
+                        if retry_after > GEMINI_MAX_RETRY_AFTER:
+                            await gemini_circuit_breaker.trip(agent)
+                            print(
+                                f"🔄 [Gemini Retry] {agent} HTTP {r.status_code} "
+                                f"(Retry-After {retry_after:.0f}s exceeds {GEMINI_MAX_RETRY_AFTER:.0f}s bound, "
+                                f"falling back to Groq)"
+                            )
+                            break
                         delay = retry_after if retry_after > 0 else backoff
                         await gemini_circuit_breaker.trip(agent)
                         if gemini_circuit_breaker.state == gemini_circuit_breaker.OPEN:
@@ -488,35 +539,55 @@ async def call_gemini_raw(prompt: str, agent: str = "agent") -> Optional[str]:
                         await gemini_circuit_breaker.trip(agent, permanent=True)
                         print(f"⚠️ [Gemini] {agent} HTTP {r.status_code} (permanent, not retrying)")
                         break
-            except Exception as e:
-                duration = time.perf_counter() - timing.start
-                timing.gemini_attempt(None, duration)
-                if _is_retryable_exception(e):
-                    await gemini_circuit_breaker.trip(agent)
-                    if gemini_circuit_breaker.state == gemini_circuit_breaker.OPEN:
-                        print(f"⚠️ [Gemini Retry] {agent} {e} (circuit opened, not retrying)")
-                        break
-                    # Circuit stayed CLOSED; retry if budget permits
-                    if attempt < quota_limiter.max_retries:
-                        if attempt == 0:
-                            print(f"⚠️ [Gemini Retry] {agent}: {e}")
-                        else:
-                            print(f"⚠️ [Gemini Retry] {agent} attempt {attempt + 1}, retrying in {backoff:.1f}s...")
-                        quota_limiter.stats["retries"] += 1
-                        await asyncio.sleep(backoff)
-                        continue
+                except Exception as e:
+                    duration = time.perf_counter() - timing.start
+                    exc_type = type(e).__name__
+                    exc_msg = _sanitize(str(e))
+                    # Map exception to a status-like value for observability
+                    if isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError)):
+                        last_status = None  # Will display as "TIMEOUT" below
+                        status_label = "TIMEOUT"
+                    elif isinstance(e, httpx.ConnectError):
+                        last_status = None
+                        status_label = "CONNECTION_ERROR"
+                    elif isinstance(e, httpx.NetworkError):
+                        last_status = None
+                        status_label = "NETWORK_ERROR"
+                    elif isinstance(e, httpx.ProxyError):
+                        last_status = None
+                        status_label = "PROXY_ERROR"
                     else:
-                        print(f"⚠️ [Gemini Retry] {agent} {e} (max retries exhausted)")
+                        last_status = None
+                        status_label = "EXCEPTION"
+                    timing.gemini_attempt(last_status, duration)
+                    if _is_retryable_exception(e):
+                        await gemini_circuit_breaker.trip(agent)
+                        if gemini_circuit_breaker.state == gemini_circuit_breaker.OPEN:
+                            print(f"⚠️ [Gemini Retry] {agent} {exc_type}: {exc_msg} (circuit opened, not retrying)")
+                            break
+                        # Circuit stayed CLOSED; retry if budget permits
+                        if attempt < quota_limiter.max_retries:
+                            if attempt == 0:
+                                print(f"⚠️ [Gemini Retry] {agent}: {exc_type}: {exc_msg}")
+                            else:
+                                print(f"⚠️ [Gemini Retry] {agent} attempt {attempt + 1}, {exc_type}: {exc_msg}, retrying in {backoff:.1f}s...")
+                            quota_limiter.stats["retries"] += 1
+                            await asyncio.sleep(backoff)
+                            continue
+                        else:
+                            print(f"⚠️ [Gemini Retry] {agent} {exc_type}: {exc_msg} (max retries exhausted)")
+                            break
+                    else:
+                        # Auth/invalid model / malformed - do NOT retry, trip circuit.
+                        await gemini_circuit_breaker.trip(agent, permanent=True)
+                        print(f"⚠️ [Gemini] {agent}: permanent error {exc_type}: {exc_msg} - no retry")
                         break
-                else:
-                    # Auth/invalid model / malformed - do NOT retry, trip circuit.
-                    await gemini_circuit_breaker.trip(agent, permanent=True)
-                    print(f"⚠️ [Gemini] {agent}: permanent error {e} - no retry")
-                    break
         # Circuit is OPEN - return None so call_llm can handle Groq failover.
         if gemini_circuit_breaker.state == gemini_circuit_breaker.OPEN:
             print(f"🔁 [Gemini CircuitBreaker] OPEN -> returning None for failover (agent={agent})")
-        print(f"❌ [Gemini Failed] {agent} all attempts exhausted (last HTTP {last_status})")
+        # Display last_status as string; None means last attempt was an exception (not HTTP response)
+        status_display = last_status if last_status is not None else status_label
+        print(f"❌ [Gemini Failed] {agent} all attempts exhausted (last HTTP {status_display})")
         return None
     finally:
         if acquired:
@@ -532,6 +603,13 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
     if not LLM_ENABLED:
         return _unavailable_result(prompt, language, "LLM_DISABLED")
 
+    # ── Performance instrumentation ──────────────────────────────
+    start = time.perf_counter()
+    cache_hit = False
+    provider_used = None
+    gemini_duration = 0.0
+    groq_duration = 0.0
+
     # 1. Check Redis Cache
     content_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
     cache_key = f"codenexus:cache:{agent}:{PRIMARY_MODEL}:{content_hash}"
@@ -540,12 +618,15 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
         try:
             cached_val = redis_client.get(cache_key)
             if cached_val:
+                cache_hit = True
                 print(f"⚡ [Redis Hit] Hash {content_hash[:8]}... served instantly.")
+                total_ms = (time.perf_counter() - start) * 1000
+                print(
+                    f"[Performance] {agent}: {total_ms:.0f} ms (cached, cache_hit=True)"
+                )
                 return cached_val
         except Exception:
             pass
-
-    provider_used = None
 
     # 2. Try Gemini Primary with circuit breaker logic
     skip_gemini = False
@@ -555,25 +636,36 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
             skip_gemini = True
 
     if not skip_gemini:
+        g_start = time.perf_counter()
         res = await call_gemini_raw(prompt, agent=agent)
+        gemini_duration = time.perf_counter() - g_start
         if res:
             provider_used = "gemini"
         else:
             # 3. Fallback to Groq API if Gemini fails
             print("🔄 [Failover] Gemini unavailable! Calling Groq...")
+            q_start = time.perf_counter()
             res = await call_groq(prompt, agent=agent)
+            groq_duration = time.perf_counter() - q_start
             if res:
                 provider_used = "groq"
     else:
         # Circuit is open and cooldown not elapsed; go directly to Groq
         print("🔄 [Failover] Gemini circuit OPEN and cooldown not elapsed, skipping Gemini and calling Groq...")
+        q_start = time.perf_counter()
         res = await call_groq(prompt, agent=agent)
+        groq_duration = time.perf_counter() - q_start
         if res:
             provider_used = "groq"
 
     # 4. If all providers fail or LLM disabled, return honest unavailable result
     if not res:
         print("⚠️ [Offline] All LLM providers unavailable.")
+        total_ms = (time.perf_counter() - start) * 1000
+        print(
+            f"[Performance] {agent}: {total_ms:.0f} ms (unavailable, "
+            f"gemini={gemini_duration:.2f}s, groq={groq_duration:.2f}s)"
+        )
         return _unavailable_result(prompt, language, "PROVIDERS_FAILED")
 
     # Cache only successful provider responses
@@ -583,6 +675,11 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
         except Exception:
             pass
 
+    total_ms = (time.perf_counter() - start) * 1000
+    print(
+        f"[Performance] {agent}: {total_ms:.0f} ms ({provider_used}, "
+        f"cache_hit={cache_hit}, gemini={gemini_duration:.2f}s, groq={groq_duration:.2f}s)"
+    )
     return res
 
 def _unavailable_result(prompt: str, language: str, reason: str) -> str:
@@ -750,13 +847,52 @@ workflow.add_edge("documentation", END)
 graph_engine = workflow.compile()
 
 async def run_pipeline(filename: str, language: str, content: str) -> dict:
-    initial_state = {
-        "filename": filename,
-        "content": content,
-        "language": language,
-        "review": "",
-        "bugs": "",
-        "refactored": "",
-        "docs": ""
+    # Run all four agent nodes concurrently so one slow/failed agent does not
+    # block the others. Each agent independently calls the LLM router, so the
+    # shared circuit breaker and per-agent timing are preserved per call.
+    async def _reviewer():
+        return await reviewer_node({
+            "filename": filename, "content": content, "language": language,
+            "review": "", "bugs": "", "refactored": "", "docs": "",
+        })
+
+    async def _bug_hunter():
+        return await bug_hunter_node({
+            "filename": filename, "content": content, "language": language,
+            "review": "", "bugs": "", "refactored": "", "docs": "",
+        })
+
+    async def _refactor():
+        return await refactor_node({
+            "filename": filename, "content": content, "language": language,
+            "review": "", "bugs": "", "refactored": "", "docs": "",
+        })
+
+    async def _docs():
+        return await docs_node({
+            "filename": filename, "content": content, "language": language,
+            "review": "", "bugs": "", "refactored": "", "docs": "",
+        })
+
+    results = await asyncio.gather(
+        _reviewer(), _bug_hunter(), _refactor(), _docs(),
+        return_exceptions=True,
+    )
+
+    merged = {}
+    agent_names = ["reviewer", "bug_hunter", "refactor", "documentation"]
+    for name, result in zip(agent_names, results):
+        if isinstance(result, Exception):
+            print(f"[Performance] {name}: FAILED ({type(result).__name__})")
+            merged[name] = ""
+        elif isinstance(result, dict):
+            merged.update(result)
+        else:
+            merged[name] = ""
+
+    return {
+        "review": merged.get("review", ""),
+        "bugs": merged.get("bugs", ""),
+        "refactored": merged.get("refactored", ""),
+        "docs": merged.get("docs", ""),
     }
-    return await graph_engine.ainvoke(initial_state)
