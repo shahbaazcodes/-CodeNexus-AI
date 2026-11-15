@@ -1,80 +1,160 @@
-# 🚀 Agentic AI Code Reviewer
+# 🛡️ CodeNexus AI — Multi-Agent Code Review System
 
-**A Multi-Agent System for Automated Code Analysis, Debugging, and Refactoring.**
-
-Powered by **Model Context Protocol (MCP)**, **Google Gemini**, and **FastAPI**.
+> **A multi-agent system for automated code analysis, bug detection, refactoring, and documentation.**
+>
+> Powered by **FastAPI**, **LangGraph**, **Python AST / Scikit-Learn**, **Google Gemini (primary)** and **Groq (fallback)**, with a vanilla HTML/CSS/JS frontend.
 
 ---
 
 ## 📌 Project Overview
-This project allows developers to upload Python code and receive instant, professional-grade feedback from a team of AI Agents. Unlike standard chatbots, this system uses an **Agentic Workflow** where specialized AI agents collaborate to solve complex problems.
 
-### 🤖 The Agent Team
-1.  **🔍 Reviewer Agent:** Analyzes code for style violations, technical debt, and bad practices.
-2.  **🐞 Bug Hunter Agent:** Detects logical errors, security risks (like bare `except`), and Python-specific traps (like mutable default args).
-3.  **🛠 Refactor Agent:** Automatically rewrites the code to be production-ready, cleaner, and more efficient.
-4.  **📝 Documentation Agent:** Generates Google-Style Docstrings and adds professional comments to the fixed code.
+CodeNexus AI lets developers upload source code and receive structured, AI-assisted feedback from a team of specialized agents working through an MCP-style analysis pipeline. Instead of a single chatbot response, the system applies **static analysis** (AST metrics + ML risk scoring) **plus** **LLM-enhanced review** to produce:
+
+* 🔍 **Architecture & performance review**
+* 🐞 **Bug & vulnerability inspection**
+* ⚡ **Production refactored code**
+* 📄 **Documented implementation** (docstrings & comments)
+
+The code is analyzed by two layers:
+
+1. **MCP Core Engine** (`mcp_server.py`, port 8000) — Python AST feature extraction, an experimental RandomForest risk classifier, and deterministic health scoring.
+2. **Web Gateway** (`web_server.py`, port 9000) — FastAPI HTTP frontend, API gateway, MCP router, input validation, and Markdown export.
+
+---
+
+## 🏗️ Architecture & Four-Agent Workflow
+
+### Components
+
+| Component | Technology | Local Port | Docker Port | Role |
+|---|---|---|---|---|
+| **MCP Core Engine** | FastAPI + Scikit-Learn + AST | 8000 | 8000 | AST metrics, ML risk classification, static bug finding, refactoring, documentation |
+| **Web Gateway** | FastAPI + Jinja2 + httpx | 9000 | 9000 | HTTP frontend, API gateway, MCP router, Markdown export |
+| **Agent Graph** | LangGraph + Gemini/Groq | N/A | N/A | Four-agent review → bug → refactor → docs pipeline |
+| **Redis** (optional) | Redis | 6379 | optional | LLM response caching (crash-safe) |
+| **Frontend** | HTML5 + CSS3 + Vanilla JS | Served by Web Gateway | Served by Web Gateway | Dark-themed code review UI |
+
+### Four-Agent Workflow (from source)
+
+The LangGraph graph defines four agent nodes (`reviewer`, `bug_hunter`, `refactor`, `documentation`) with sequential edges, but `run_pipeline()` in `agents.py` invokes all four nodes **concurrently** via `asyncio.gather` so no single slow or failed agent blocks the others.
+
+Each agent calls the shared LLM router (`call_llm`), which routes to **Gemini (primary)** first and falls back to **Groq** on failure, with Redis caching and a Gemini circuit breaker.
+
+```
+User submits code (POST /analyze)
+        │
+        ▼
+┌─────────────────────────────┐
+│  MCP Core Engine (/code/*)  │  AST features + health_score + risk_level
+│  (static analysis, ML risk) │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│  run_pipeline() (LangGraph) │  Four agents run concurrently:
+│                             │   • Reviewer        (review)
+│                             │   • Bug Hunter      (bugs)
+│                             │   • Refactor Agent  (refactored)
+│                             │   • Doc Agent       (docs)
+└─────────────────────────────┘
+        │
+        ▼
+Web Gateway merges static metrics + agent output → returns JSON
+        │
+        ▼
+Frontend renders review, bugs, refactored code, docs, health score, risk level
+```
+
+> **Not "official MCP":** CodeNexus AI uses an **MCP-style** architecture — a custom FastAPI service (`mcp_server.py`) that exposes analysis tools over HTTP. It does **not** implement the official Model Context Protocol specification.
 
 ---
 
 ## ⚙️ Tech Stack
-* **Backend:** Python 3.12+, FastAPI (Async Web Server)
-* **Frontend:** HTML5, CSS3 (Dark Mode), Vanilla JS
-* **AI Model:** Google Gemini (configurable via `GEMINI_MODEL`, defaults to `gemini-3.8-flash`)
-* **Architecture:** Client-Server (MCP Pattern)
-* **Security:** Environment Variable Management (`python-dotenv`) for API Keys
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.12+, FastAPI (async) |
+| Agent orchestration | LangGraph |
+| Static analysis | Python `ast`, Scikit-Learn `RandomForestClassifier` |
+| LLM providers | Google Gemini (`gemini-3.6-flash`, primary), Groq (`openai/gpt-oss-120b`, fallback) |
+| HTTP client | `httpx` |
+| Frontend | HTML5, CSS3 (dark mode), Vanilla JS |
+| Templates | Jinja2 |
+| Caching (optional) | Redis |
+| Config | `python-dotenv` (`.env`, gitignored — never committed) |
+
+## 🔑 Model Configuration (verified from source)
+
+Defaults are read from environment variables (see `.env.example`; never `.env`):
+
+| Setting | Default | Source |
+|---|---|---|
+| `GEMINI_MODEL` | `gemini-3.6-flash` | `agents.py` line 28 / `.env.example` |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | `agents.py` line 29 / `.env.example` |
+| `PRIMARY provider` | **Gemini** | `call_llm()` tries Gemini first |
+| `FALLBACK provider` | **Groq** | `call_llm()` falls back to Groq on Gemini failure |
+| `LLM_ENABLED` | `1` | `1` = live LLM, `0` = skip all LLM network calls |
+| `LLM_STUB` | `0` | `1` = deterministic stub text, no network |
+| `MCP_BASE` | `http://127.0.0.1:8000` | Web Gateway → MCP Core Engine URL |
+
+### Routing behavior (from `agents.py` `call_llm()`)
+
+1. If `LLM_STUB=1` → returns deterministic stub text (no network).
+2. If `LLM_ENABLED=0` → returns "LLM analysis disabled" result (no network).
+3. Otherwise → checks Redis cache, then tries **Gemini primary**; on failure → falls back to **Groq**.
+4. If all providers fail → returns a clearly marked "unavailable" result; static-analysis metrics are still returned.
+
+**Important:** Observed live behavior — Gemini experienced timeouts under load and the **Groq fallback was observed**; Gemini was **not** consistently successful. Do not rely on Gemini alone for production latency.
 
 ---
 
-## 🚀 How to Run Locally
+## 🚀 Installation & Local Execution
 
-### 1. Prerequisites
-* Python 3.10 or higher
-* A Google Gemini API Key (Free) — only needed for live LLM analysis
+### Prerequisites
+* Python 3.10 or higher (3.12+ recommended)
+* A Google Gemini API key (free tier) — **only** needed for live LLM analysis
+* Optional: Groq API key for the fallback provider
 
-### 2. Installation
+### 1. Clone & create virtual environment
 ```bash
-# Clone the repository
-git clone [https://github.com/yourusername/ai-code-reviewer.git](https://github.com/yourusername/ai-code-reviewer.git)
-cd ai-code-reviewer
-
-# Create Virtual Environment
+git clone https://github.com/shahbaazcodes/-CodeNexus-AI.git
+cd -CodeNexus-AI
 python3 -m venv venv
 source venv/bin/activate
+```
 
-# Install Dependencies
+### 2. Install dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
-Create a `.env` file in the root directory and add your key:
+### 3. Configure (`.env` — gitignored, never committed)
+Copy `.env.example` to `.env` and fill in your keys:
 
-```
-GEMINI_API_KEY="_YOUR_API_KEY_HERE"
-MCP_BASE=http://127.0.0.1:8000
-LLM_STUB=0
-LLM_ENABLED=1
+```bash
+cp .env.example .env
+# edit .env with your GEMINI_API_KEY / GROQ_API_KEY
 ```
 
-> **Stub mode (no API key required):** Set `LLM_ENABLED=0` and `LLM_STUB=1` in `.env` (or pass them at runtime) to run offline without calling Gemini/Groq. The pipeline then returns deterministic stub text while still performing real MCP static-analysis metrics.
+Never paste real API keys into this README, issues, or commits. `.env` is excluded from version control via `.gitignore`.
 
-### 4. Start the System
-You need to run the Tool Engine and the Web UI in separate terminals.
+### 4. Start the two services (separate terminals)
 
-Terminal 1 (MCP Tool Server):
-
+Terminal 1 — MCP Core Engine (port 8000):
 ```bash
 uvicorn mcp_server:app --reload --port 8000
 ```
 
-Terminal 2 (Web Dashboard):
-
+Terminal 2 — Web Gateway (port 9000):
 ```bash
 python3 web_server.py
 ```
 
 ### 5. Usage
-Open your browser to http://127.0.0.1:9000 and start analyzing code!
+Open http://127.0.0.1:9000 in your browser and submit code for analysis.
+
+### Stub / offline mode (no API key required)
+Set `LLM_ENABLED=0` and `LLM_STUB=1` in `.env` (or pass at runtime). The pipeline returns deterministic stub LLM text while still running real MCP static-analysis metrics. Ideal for offline demos and CI.
 
 ---
 
@@ -138,16 +218,121 @@ docker compose down --rmi all
 
 ---
 
-🛡️ Security Features
-No Hardcoded Secrets: API keys are managed via `.env` and excluded from version control via `.gitignore`.
+## 📡 API Endpoints
 
-Input Sanitization: The Web Server validates all incoming code requests using Pydantic models.
+### Web Gateway (`web_server.py`, port 9000)
 
-🔮 Future Improvements
-Add support for Java and C++ analysis.
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `GET /` | GET | Serve the web UI (index.html) |
+| `GET /health` | GET | Application health status |
+| `GET /health/providers` | GET | Provider availability (mcp, gemini, groq, redis) |
+| `POST /analyze` | POST | Full code analysis (metrics + 4-agent pipeline) |
+| `POST /export/markdown` | POST | Render an analysis result as Markdown report |
 
-Integrate directly with GitHub Webhooks for automatic PR reviews.
+#### `POST /analyze` example
+```bash
+curl -X POST http://127.0.0.1:9000/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "main.py",
+    "language": "python",
+    "content": "def foo():\n    try:\n        x = 1/0\n    except:\n        pass\n  }'
+```
 
-Add "Download Report" feature to export findings as PDF.
+Response includes `review`, `bugs`, `refactored`, `docs`, `health_score`, `risk_level`, and `metrics`.
 
-Built by [ SHAHBAAZ KHAN ] | Class of 2022-2026
+### MCP Core Engine (`mcp_server.py`, port 8000)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `GET /health` | GET | Engine health |
+| `POST /code/metrics` | POST | AST features + health score + ML risk level |
+| `POST /code/analyze` | POST | Static issues from metrics |
+| `POST /code/find_bugs` | POST | Language-specific bug detection |
+| `POST /code/document` | POST | Docstring header generation |
+| `POST /code/refactor` | POST | Rule-based code refactoring |
+
+#### `POST /code/metrics` example
+```bash
+curl -X POST http://127.0.0.1:8000/code/metrics \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"main.py","language":"python","content":"x = 1"}'
+```
+
+Response includes `cyclomatic_complexity`, `line_count`, `bare_excepts_or_unfreed`, `todo_count`, `nesting_depth`, `health_score` (0–100), `risk_level` (Low/Medium/High/Critical), `parse_error`, `none_eq_count`, and `ml_classifier: "experimental"`.
+
+---
+
+## 🧪 Testing
+
+All tests are **offline by default** — no live Gemini/Groq calls are made, so no provider quotas are consumed.
+
+### Run the full suite
+```bash
+source venv/bin/activate
+python -m pytest tests/ -q
+```
+
+### Verified result
+```
+83 passed in <1s
+```
+
+Breakdown:
+* `tests/test_web_gateway.py` — 17 tests (valid input, invalid input, oversized requests, unavailable services, malformed responses, disabled LLM, Markdown export, health endpoints)
+* `tests/test_eval_suite.py` — 20 tests (evaluator dataset schema, metric calculations, report generation)
+* `tests/test_llm_reliability.py` — 46 tests (LLM retry/failover/quota/circuit-breaker reliability)
+
+All 83 tests pass. Tests mock all HTTP/MCP calls; no real LLM provider is invoked during routine runs.
+
+> The test count above was verified by running the suite at implementation time. If you modify tests or dependencies, rerun `python -m pytest tests/ -q` to confirm the current result.
+
+---
+
+## ⚠️ Limitations & Known Issues
+
+* **ML risk classifier is experimental.** The `RandomForestClassifier` in `mcp_server.py` is trained on **six synthetic rows** with manually assigned labels. It has not been evaluated on independently labelled real-world code. Treat `risk_level` as a rough heuristic, not a verified prediction. The deterministic `health_score` formula is the primary trusted signal.
+* **Health score is deterministic, not ML-derived.** It is computed from AST metrics (complexity, bare excepts, nesting depth, TODOs) via a fixed deduction formula — not a trained model.
+* **Gemini is not consistently successful.** In live validation, Gemini experienced timeouts and the **Groq fallback was observed**. Do not claim Gemini was consistently successful; always design for fallback.
+* **Not official MCP.** CodeNexus AI implements an **MCP-style** custom FastAPI service, not the official Model Context Protocol specification.
+* **No production deployment, benchmarks, or performance claims** are made in this project. Do not cite users, throughput, or uptime figures that are not measured.
+* **Small evaluation dataset.** The eval suite contains 20 labelled cases; results are not sufficient to establish generalization across languages or real-world security scenarios.
+* **Concurrent agent execution.** `run_pipeline()` runs all four agents concurrently via `asyncio.gather`; the LangGraph edges themselves are sequential in definition but the pipeline invokes nodes directly and concurrently.
+
+---
+
+## 🖼️ Portfolio Demo & Screenshots
+
+This section uses **existing repository assets only**. No new images were created or requested.
+
+The project includes a dark-themed frontend (`templates/index.html`, `static/script.js`, `static/style.css`) served by the Web Gateway at http://127.0.0.1:9000. To capture a portfolio demo:
+
+1. Start the system locally (see "Installation & Local Execution") — stub mode works with no API keys.
+2. Open the Web Gateway in your browser.
+3. Submit a Python sample (e.g., a function with a bare `except` and `== None`) and observe the review, bugs, refactored code, docs, health score, and risk level.
+4. Screenshot the results page for your portfolio.
+
+No additional screenshot/image assets exist in the repository beyond the frontend source. If you want custom screenshots or diagrams added, request approval before creating them.
+
+---
+
+## 🔒 Security
+
+* API keys live in `.env` (gitignored) and are **never** copied into Docker images or committed.
+* The Web Gateway validates all incoming code requests with Pydantic v2 models (filename traversal, unsupported language, oversized content rejected).
+* Markdown export makes no LLM or MCP calls — it renders the supplied payload directly.
+* Quarantine store records only minimal metadata (no source code, no secrets, no stack traces).
+
+---
+
+## 🔮 Future Improvements (not planned for Phase 8)
+
+* Add first-class support for additional languages beyond Python/JavaScript/C++/Java.
+* Integrate with GitHub webhooks for automatic PR reviews.
+* Add "Download Report" PDF export.
+* Replace the experimental 6-row ML classifier with a labelled real-world dataset.
+
+---
+
+Built by **[Shahbaaz Khan]** — Class of 2022–2026
