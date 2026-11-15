@@ -13,6 +13,7 @@ failures, no fabricated findings, Redis crash-safe.
 import os
 import json
 import re
+import time
 import httpx
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -277,7 +278,7 @@ def _validate_pipeline_output(raw: Any) -> AgentAnalysisResponse:
 # ─── Routes ─────────────────────────────────────────────────────────────
 @app.get("/")
 def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 
 @app.get("/health")
@@ -336,8 +337,14 @@ async def analyze_code(payload: CodeInput) -> AgentAnalysisResponse:
         "language": payload.language,
     }
 
-    # MCP metrics: one bounded call, degrade gracefully on failure.
+    # ── Performance instrumentation ──────────────────────────────
+    analyze_start = time.perf_counter()
+
+    # MCP metrics / AST extraction: one bounded call, degrade gracefully on failure.
+    mcp_start = time.perf_counter()
     health_score, risk_level, metrics = await _safe_metrics(mcp_payload)
+    mcp_ms = (time.perf_counter() - mcp_start) * 1000
+    print(f"[Performance] AST/MCP extraction: {mcp_ms:.0f} ms")
 
     # LangGraph pipeline: invoke exactly once; never retry on exception.
     raw: Any = None
@@ -456,6 +463,9 @@ async def analyze_code(payload: CodeInput) -> AgentAnalysisResponse:
             for item in exc.errors(include_input=False)
         ]
         raise ValueError(f"pipeline schema validation failed: {issues}") from exc
+
+    total_ms = (time.perf_counter() - analyze_start) * 1000
+    print(f"[Performance] Total analysis: {total_ms:.0f} ms")
 
     return result
 
