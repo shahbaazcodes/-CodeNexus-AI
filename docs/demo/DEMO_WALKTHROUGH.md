@@ -163,6 +163,71 @@ Switch through the tabs and narrate what is **actual** vs **static** vs **LLM-ge
 
 ---
 
+## 9. Controlled End-to-End Validation Results (Week 10 Portfolio Evidence)
+
+### 9.1 Test Summary
+
+| Item | Detail |
+|------|--------|
+| **Test type** | Single controlled end-to-end analysis request against running Docker environment |
+| **Target endpoint** | `POST http://localhost:9000/analyze` (Web Gateway) |
+| **Request schema** | `{ filename: str, language: str, content: str }` (Pydantic `CodeInput`) |
+| **Test input** | Short Python function with intentional issues: bare `except:`, `== None` comparison, missing type hints, no docstring |
+| **HTTP status** | `200 OK` |
+| **Pipeline completed?** | Yes — full analysis returned: `review`, `bugs`, `refactored`, `docs`, `health_score`, `risk_level`, `metrics` |
+| **Execution time** | ~13,547 ms (≈13.5 seconds) |
+| **Errors / timeouts** | None — complete response with no partial failures |
+
+### 9.2 Request Payload
+
+```json
+{
+  "filename": "test_sample.py",
+  "language": "python",
+  "content": "def process_data(data):\\n    try:\\n        result = data[\"key\"]\\n        if result == None:\\n            return None\\n        return result\\n    except:\\n        pass\\n"
+}
+```
+
+Intentional issues embedded: bare `except:` swallows all exceptions; `result == None` anti-pattern instead of `is None`; no type hints; no docstring.
+
+### 9.3 Observed Response (verbatim excerpt)
+
+- **HTTP status:** 200
+- **`review`:** Returned — full architectural review (design patterns, performance/O(1) complexity, actionable improvements)
+- **`bugs`:** Returned — bug inspection with fixes
+- **`refactored`:** Returned — production refactored code with `is None`, specific `KeyError` catch, logging, docstring
+- **`docs`:** Returned — module docstring + documented code
+- **`health_score`:** 76 / 100
+- **`risk_level`:** "Low"
+- **`metrics`:** cyclomatic_complexity: 2; line_count: 8; bare_excepts_or_unfreed: 1; todo_count: 0; nesting_depth: 2; none_eq_count: 1; parse_error: null; ml_classifier: "experimental"
+
+### 9.4 Model Routing and Fallback Observations
+
+*Previously verified (from source inspection):* `call_llm` routes to **Gemini (primary)** first and falls back to **Groq** on failure. Gemini circuit breaker enabled (opens after 3 consecutive transient failures, 30s cooldown). Bounded retries (`MAX_INTERACTIVE_RETRIES=2`, transient 429/5xx only). Redis caches LLM responses crash-safe; failures never cached. **Cost exposure per analysis:** up to 4 LLM calls (1 per agent), each subject to retries + fallback.
+
+*Observed during this test:* The response contained substantive provider-generated prose (architectural review, refactored code, documentation), confirming at least one LLM provider responded within the ~13.5s window. The exact provider (Gemini vs Groq) used per agent is **not explicitly surfaced** in the response schema — no provider/routing field is included. This test cannot independently confirm which provider served each agent; do not claim a specific provider without observable evidence.
+
+### 9.5 Redis Caching Observations
+
+*Previously verified (from source inspection):* Redis caches LLM responses with a routing-config-fingerprint key. Cache failures do not crash the app — falls back to direct LLM calls. Failures are never cached.
+
+*Observed during this test:* Not directly observable from a single request (no cache-hit/miss indicator in response schema). A repeated identical request would be needed to confirm cache-hit behavior, but that was deliberately avoided to limit unnecessary API calls.
+
+### 9.6 Issue Detection Verification
+
+| Intentional Issue | Detected? | Evidence |
+|-------------------|-----------|----------|
+| Bare `except:` | **Yes** | `bare_excepts_or_unfreed: 1` in metrics; review flags "Bare `except:` swallows all exceptions" |
+| `result == None` anti-pattern | **Yes** | `none_eq_count: 1` in metrics; review flags "`if result == None:` uses `==` instead of `is`" |
+| No type hints | **Yes** | Review notes "No type hints, no validation of `data`" |
+| No docstring | **Yes** | Review notes "No docstring"; docs agent produces documented code |
+| Health score | Yes | `health_score: 76` (deterministic formula: 100 - deductions) |
+| Risk classification | Yes | `risk_level: "Low"` |
+
+### 9.7 Partial-Failure Handling
+
+The application did not crash or return partial/incomplete results. All four agent outputs plus static metrics were present in the single response. Schema validation at the API boundary (`AgentAnalysisResponse.model_validate`) confirms structural integrity.
+
 ## 10. Honest Limitations and Known Issues
 
 State these proactively — recruiters value honesty:
