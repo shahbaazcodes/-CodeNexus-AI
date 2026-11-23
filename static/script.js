@@ -2,6 +2,43 @@
 
 let lastAnalysis = null;
 
+// Session-scoped demo API key. Kept in session memory / sessionStorage only
+// (never localStorage, never embedded in HTML/JS/images/Git). Cleared when the
+// browser tab/session ends.
+let demoApiKey = sessionStorage.getItem('codenexus_api_key') || '';
+
+function apiKeyHeaders() {
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+    if (demoApiKey) {
+        headers['X-API-Key'] = demoApiKey;
+    }
+    return headers;
+}
+
+function setDemoApiKey(key) {
+    demoApiKey = String(key ?? '').trim();
+    if (demoApiKey) {
+        sessionStorage.setItem('codenexus_api_key', demoApiKey);
+    } else {
+        sessionStorage.removeItem('codenexus_api_key');
+    }
+    updateApiKeyUI();
+}
+
+function clearDemoApiKey() {
+    setDemoApiKey('');
+}
+
+function updateApiKeyUI() {
+    const input = document.getElementById('api-key-input');
+    const status = document.getElementById('api-key-status');
+    if (input) input.value = demoApiKey ? '••••••••' : '';
+    if (status) {
+        status.textContent = demoApiKey ? 'API key set (this session only)' : 'No API key — AI analysis disabled';
+        status.className = demoApiKey ? 'api-key-set' : 'api-key-missing';
+    }
+}
+
 function escapeHtml(value) {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -88,6 +125,12 @@ async function analyzeCode() {
         return;
     }
 
+    if (!demoApiKey) {
+        setText('review-output', 'Please enter your demo API key above before running analysis.');
+        switchTab('review');
+        return;
+    }
+
     if (button) button.disabled = true;
     hideAllLoaders();
     ['review', 'bugs', 'refactor', 'docs'].forEach(name => showLoader(name, true));
@@ -100,7 +143,7 @@ async function analyzeCode() {
     try {
         const response = await fetch('/analyze', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            headers: apiKeyHeaders(),
             body: JSON.stringify({ filename: filenameForLanguage(language), language, content })
         });
         const result = await response.json().catch(() => ({}));
@@ -146,7 +189,7 @@ async function downloadReport() {
     try {
         const response = await fetch('/export/markdown', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            headers: apiKeyHeaders(),
             body: JSON.stringify(lastAnalysis)
         });
         const result = await response.json().catch(() => ({}));
@@ -175,3 +218,12 @@ async function downloadReport() {
 window.analyzeCode = analyzeCode;
 window.downloadReport = downloadReport;
 window.switchTab = switchTab;
+window.setDemoApiKey = setDemoApiKey;
+window.clearDemoApiKey = clearDemoApiKey;
+
+// Initialize API key UI state once the DOM is ready.
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', updateApiKeyUI);
+} else {
+    updateApiKeyUI();
+}

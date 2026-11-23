@@ -13,16 +13,18 @@ failures, no fabricated findings, Redis crash-safe.
 import os
 import json
 import re
+import secrets
 import time
 import httpx
 from pathlib import Path
 from typing import Any, Dict, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from agents import run_pipeline, LLM_ENABLED, LLM_STUB
+from usage_meter import usage_meter  # usage metering & cost guard
 
 app = FastAPI(title="CodeNexus AI — Web Gateway", version="2.1.0")
 
@@ -40,6 +42,52 @@ SUPPORTED_LANGUAGES = {
 MAX_FILENAME_LEN = 120
 MAX_CONTENT_LEN = 64 * 1024  # 64 KiB
 MCP_TIMEOUT = float(os.getenv("MCP_TIMEOUT", "5.0"))
+
+# ─── API key authentication (demo) ───────────────────────────────────────
+# Expected API key read from environment (supplied via deployment env/SSM,
+# never hardcoded, never read from .env). Protects AI-consuming endpoints.
+CODENEXUS_API_KEY = os.getenv("CODENEXUS_API_KEY", "").strip()
+
+
+def _require_api_key(request: Request) -> Optional[JSONResponse]:
+    """Reject requests missing or presenting an invalid API key.
+
+    Uses constant-time comparison. Returns a 401 JSONResponse on failure,
+    None on success. The configured key is never logged or returned in
+    responses. Returning the response directly (instead of raising
+    HTTPException) avoids interception by the app's catch-all exception
+    handler.
+    """
+    provided = request.headers.get("x-api-key", "")
+    if not CODENEXUS_API_KEY or not secrets.compare_digest(provided, CODENEXUS_API_KEY):
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"code": "UNAUTHORIZED", "message": "Invalid or missing API key"}},
+        )
+    return None
+
+
+# Routes that require authentication: any endpoint that can trigger AI
+# processing or reveal provider/usage state.
+API_KEY_ROUTES = {
+    "/analyze",
+    "/usage/summary",
+    "/health/providers",
+}
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """Enforce API key on AI-consuming / sensitive routes before any
+    provider call or expensive processing. /health stays public for ECS
+    health checks; / and /static stay public so the demo UI loads."""
+    if request.url.path in API_KEY_ROUTES:
+        denial = _require_api_key(request)
+        if denial is not None:
+            return denial
+    response = await call_next(request)
+    return response
+
 
 SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -290,6 +338,30 @@ def health() -> Dict[str, Any]:
         "version": "2.1.0",
         "llm_enabled": LLM_ENABLED,
         "llm_stub": LLM_STUB,
+    }
+
+
+@app.get("/usage/summary")
+def usage_summary() -> Dict[str, Any]:
+    """Usage summary for the AI Usage Tracking & Token Cost Guard.
+
+    Counters are in-memory, reset on process restart, and are scoped to this
+    single application instance (not shared across ECS Fargate tasks). No API
+    keys or provider credentials are ever returned.
+    """
+    summary = usage_meter.get_summary()
+    return {
+        "enabled": usage_meter.enabled,
+        "limit_reached": summary.limit_reached,
+        "limit_reason": summary.limit_reason,
+        "total_requests": summary.total_requests,
+        "input_tokens": summary.input_tokens,
+        "output_tokens": summary.output_tokens,
+        "total_tokens": summary.total_tokens,
+        "estimated_total_cost_usd": round(summary.estimated_total_cost_usd, 6),
+        "estimated_cost_label": "estimate_only_not_actual_billing",
+        "storage": "in_memory_resets_on_restart",
+        "scope": "single_application_instance",
     }
 
 

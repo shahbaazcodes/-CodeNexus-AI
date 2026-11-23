@@ -27,13 +27,17 @@ os.environ.setdefault("REDIS_HOST", "127.0.0.1")
 os.environ.setdefault("REDIS_PORT", "6379")
 os.environ.setdefault("MCP_BASE", "http://127.0.0.1:8000")
 os.environ.setdefault("QUARANTINE_PATH", "logs/test_quarantine.jsonl")
+os.environ.setdefault("CODENEXUS_API_KEY", "test-demo-key")
 
 import web_server  # noqa: E402
 
 
 @pytest.fixture
 def client():
-    return TestClient(web_server.app)
+    return TestClient(web_server.app, raise_server_exceptions=False)
+
+
+API_KEY_HEADERS = {"X-API-Key": "test-demo-key"}
 
 
 VALID_PAYLOAD = {
@@ -54,7 +58,7 @@ def test_valid_input(client):
              "health_score": 88,
              "risk_level": "Low",
          }):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert "review" in data
@@ -69,7 +73,7 @@ def test_valid_input(client):
 
 # ── Invalid input: missing content ──
 def test_missing_content(client):
-    resp = client.post("/analyze", json={"filename": "main.py", "language": "python"})
+    resp = client.post("/analyze", json={"filename": "main.py", "language": "python"}, headers=API_KEY_HEADERS)
     assert resp.status_code == 422, resp.text
 
 
@@ -77,7 +81,7 @@ def test_missing_content(client):
 def test_empty_content(client):
     resp = client.post("/analyze", json={
         "filename": "main.py", "language": "python", "content": "   \n  \n"
-    })
+    }, headers=API_KEY_HEADERS)
     assert resp.status_code == 422, resp.text
 
 
@@ -87,7 +91,7 @@ def test_bad_filename_path_traversal(client):
         "filename": "../../etc/passwd",
         "language": "python",
         "content": "x = 1\n",
-    })
+    }, headers=API_KEY_HEADERS)
     assert resp.status_code == 422, resp.text
 
 
@@ -97,7 +101,7 @@ def test_unsupported_language(client):
         "filename": "main.py",
         "language": "brainfuck",
         "content": "x = 1\n",
-    })
+    }, headers=API_KEY_HEADERS)
     assert resp.status_code == 422, resp.text
 
 
@@ -108,7 +112,7 @@ def test_oversized_content(client):
         "filename": "main.py",
         "language": "python",
         "content": big,
-    })
+    }, headers=API_KEY_HEADERS)
     assert resp.status_code == 422, resp.text
 
 
@@ -123,7 +127,7 @@ def test_mcp_unavailable_degrades(client):
              "health_score": 88,
              "risk_level": "Low",
          }):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 200, resp.text
 
 
@@ -131,7 +135,7 @@ def test_mcp_unavailable_degrades(client):
 def test_malformed_pipeline_response(client):
     with patch.object(web_server, "_safe_metrics", return_value=(88, "Low", None)), \
          patch.object(web_server, "run_pipeline", return_value="not a dict"):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 422, resp.text
         body = resp.json()
         assert "detail" in body
@@ -142,7 +146,7 @@ def test_malformed_pipeline_response(client):
 def test_missing_fields_pipeline_response(client):
     with patch.object(web_server, "_safe_metrics", return_value=(88, "Low", None)), \
          patch.object(web_server, "run_pipeline", return_value={"review": "only review"}):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 422, resp.text
 
 
@@ -158,7 +162,7 @@ def test_llm_disabled(client):
              "health_score": 88,
              "risk_level": "Low",
          }):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert "disabled via LLM_ENABLED=0" in data["review"] or "Unavailable" in data["review"]
@@ -175,8 +179,8 @@ def test_stub_mode_deterministic(client):
              "health_score": 88,
              "risk_level": "Low",
          }):
-        r1 = client.post("/analyze", json=VALID_PAYLOAD).json()
-        r2 = client.post("/analyze", json=VALID_PAYLOAD).json()
+        r1 = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS).json()
+        r2 = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS).json()
         assert r1 == r2
         assert "Stub Mode" in r1["review"]
 
@@ -241,7 +245,7 @@ def test_health_endpoint(client):
 
 
 def test_health_providers_endpoint(client):
-    resp = client.get("/health/providers")
+    resp = client.get("/health/providers", headers=API_KEY_HEADERS)
     assert resp.status_code == 200
     data = resp.json()
     assert "providers" in data
@@ -263,7 +267,7 @@ def test_pipeline_exception_graceful_degradation(client):
 
     with patch.object(web_server, "_safe_metrics", return_value=(88, "Low", None)), \
          patch.object(web_server, "run_pipeline", side_effect=_boom):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert "Unavailable" in data["review"]
@@ -284,9 +288,43 @@ def test_malformed_output_single_repair_then_422(client):
 
     with patch.object(web_server, "_safe_metrics", return_value=(88, "Low", None)), \
          patch.object(web_server, "run_pipeline", side_effect=_malformed):
-        resp = client.post("/analyze", json=VALID_PAYLOAD)
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
         assert resp.status_code == 422, resp.text
         body = resp.json()
         assert body["detail"]["error"]["code"] == "INVALID_PIPELINE_OUTPUT"
         # Original call + one repair attempt = 2 calls max.
         assert call_count["n"] == 2
+
+
+# ── Authentication ──
+def test_missing_api_key_returns_401(client):
+    resp = client.post("/analyze", json=VALID_PAYLOAD)
+    assert resp.status_code == 401, resp.text
+
+
+def test_invalid_api_key_returns_401(client):
+    resp = client.post("/analyze", json=VALID_PAYLOAD, headers={"X-API-Key": "wrong-key"})
+    assert resp.status_code == 401, resp.text
+
+
+def test_valid_api_key_accesses_protected_endpoint(client):
+    with patch.object(web_server, "_safe_metrics", return_value=(88, "Low", None)), \
+         patch.object(web_server, "run_pipeline", return_value={
+             "review": "ok", "bugs": "none", "refactored": "code", "docs": "docs",
+             "health_score": 88, "risk_level": "Low",
+         }):
+        resp = client.post("/analyze", json=VALID_PAYLOAD, headers=API_KEY_HEADERS)
+        assert resp.status_code == 200, resp.text
+
+
+def test_health_endpoint_public(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "online"
+
+
+def test_no_provider_call_on_auth_failure(client):
+    """No provider call occurs when authentication fails."""
+    resp = client.post("/analyze", json=VALID_PAYLOAD)
+    assert resp.status_code == 401

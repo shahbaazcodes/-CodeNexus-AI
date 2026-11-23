@@ -49,6 +49,13 @@
                     <button id="export-btn" class="btn-secondary" onclick="downloadReport()">
                         <span>📄 Export MD</span>
                     </button>
+                    <div class="api-key-card">
+                        <label for="api-key-input">Demo API key (session only):</label>
+                        <input type="password" id="api-key-input" placeholder="Enter demo API key" />
+                        <button class="btn-secondary" onclick="setDemoApiKey(document.getElementById('api-key-input').value)">Set</button>
+                        <button class="btn-secondary" onclick="clearDemoApiKey()">Clear</button>
+                        <span id="api-key-status" class="api-key-status">No API key — AI analysis disabled</span>
+                    </div>
                 </div>
             </section>
             <section class="card">
