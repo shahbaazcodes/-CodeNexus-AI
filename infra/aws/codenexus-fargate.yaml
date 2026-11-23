@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodeNexus AI — AWS ECS Fargate deployment (temporary, cost-conscious demo).
+  Region: ap-south-1 (Mumbai).
+
+  Architecture: Single ECS Fargate task containing two containers:
+    - web-gateway  : FastAPI on port 9000 (public, receives user traffic)
+    - mcp-core     : FastAPI on port 8000 (localhost-only, private; web reaches it via 127.0.0.1:8000)
+
+  Only port 9000 is exposed externally. MCP is NOT reachable from outside the task.
+  No Application Load Balancer. No NAT Gateway. No ElastiCache (Redis optional,
+  app degrades gracefully). Secrets stored in SSM SecureString parameters.
+
+  No credentials, account IDs, or secret values are hardcoded in this template.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment settings
+        Parameters:
+          - EnvironmentName
+          - ContainerImageTag
+          - DesiredCount
+          - TaskCpu
+          - TaskMemory
+      - Label:
+          default: Secret parameter names (SSM SecureString)
+        Parameters:
+          - GeminiApiKeyParameterName
+          - GroqApiKeyParameterName
+          - CodemexusApiKeyParameterName
+      - Label:
+          default: Usage-guard tuning (environment variables, per task)
+        Parameters:
+          - AIMaxRequestsPerSession
+          - AIMaxEstimatedCostPerSession
+          - AIMaxTokensPerRequest
+          - LLMEnabled
+          - LLMStub
+          - AIUsageLimitEnabled
+    ParameterLabels:
+      EnvironmentName:
+        default: Environment name prefix (used for resource naming)
+      ContainerImageTag:
+        default: Container image tag (e.g. latest or a git SHA)
+      DesiredCount:
+        default: Number of Fargate tasks to run (set to 0 when not demoing)
+      TaskCpu:
+        default: Fargate task CPU (vCPU units, e.g. 512 = 0.5 vCPU)
+      TaskMemory:
+        default: Fargate task memory (MB, e.g. 1024 = 1 GB)
+      GeminiApiKeyParameterName:
+        default: SSM SecureString parameter name holding the Gemini API key
+      GroqApiKeyParameterName:
+        default: SSM SecureString parameter name holding the Groq API key
+      AIMaxRequestsPerSession:
+        default: Max live AI requests per session per task (usage guard)
+      AIMaxEstimatedCostPerSession:
+        default: Max estimated USD cost per session per task (usage guard)
+      AIMaxTokensPerRequest:
+        default: Max combined input+output tokens per single request (usage guard)
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: codenexus-demo
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    MinLength: 3
+    MaxLength: 24
+    Description: Prefix applied to resource names. Lowercase alphanumeric + hyphen only.
+
+  ContainerImageTag:
+    Type: String
+    Default: latest
+    Description: Image tag to deploy (built locally and pushed to ECR before deployment).
+
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 5
+    Description: Number of Fargate tasks to run. Set to 1 to start billable Fargate compute for demonstration; set to 0 when not demoing to stop compute charges.
+
+  TaskCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: Fargate task CPU in units (512 = 0.5 vCPU). Arm64 pricing applies.
+
+  TaskMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+    Description: Fargate task memory in MiB (1024 = 1 GB).
+
+  GeminiApiKeyParameterName:
+    Type: AWS::SSM::Parameter::Name
+    Default: /codenexus/demo/gemini-api-key
+    Description: SSM SecureString parameter name containing the Gemini API key. Must exist before stack creation.
+
+  GroqApiKeyParameterName:
+    Type: AWS::SSM::Parameter::Name
+    Default: /codenexus/demo/groq-api-key
+    Description: SSM SecureString parameter name containing the Groq API key. Must exist before stack creation.
+
+  CodemexusApiKeyParameterName:
+    Type: AWS::SSM::Parameter::Name
+    Default: /codenexus/demo/api-key
+    Description: SSM SecureString parameter name containing the demo API key used to protect AI-consuming endpoints. Must exist before stack creation.
+
+  AIMaxRequestsPerSession:
+    Type: String
+    Default: "50"
+    Description: "Usage guard: max live AI requests per session per task."
+
+  AIMaxEstimatedCostPerSession:
+    Type: String
+    Default: "1.00"
+    Description: "Usage guard: max estimated USD cost per session per task (estimate only, not a provider billing cap)."
+
+  AIMaxTokensPerRequest:
+    Type: String
+    Default: "4000"
+    Description: "Usage guard: max combined input+output tokens per single request (default 4000; 0 = unlimited)."
+
+  LLMEnabled:
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+    Description: >-
+      LLM live-call switch. "0" (default) disables all provider network calls;
+      "1" enables live Gemini/Groq calls (requires valid provider keys). Live
+      mode must be selected explicitly; do not enable automatically.
+
+  LLMStub:
+    Type: String
+    Default: "1"
+    AllowedValues: ["0", "1"]
+    Description: >-
+      Deterministic stub mode. "1" (default) returns stub text with no network
+      calls; "0" allows live provider calls. For live AI set LLMStub=0 and
+      LLMEnabled=1.
+
+  AIUsageLimitEnabled:
+    Type: String
+    Default: "1"
+    AllowedValues: ["0", "1"]
+    Description: >-
+      Usage guard master switch. "1" (default) enforces the AI usage limits
+      (requests, estimated cost, per-request tokens). "0" disables the usage
+      guard for this task instance.
+
+Conditions:
+  IsArm64: !Equals [!Ref "AWS::Region", "ap-south-1"]
+
+Resources:
+  # ------------------------------------------------------------------
+  # Networking: dedicated VPC + public subnet (self-contained template)
+  # ------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+        - Key: Project
+          Value: CodeNexusAI
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]  # single AZ for cost-conscious demo
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet"
+        - Key: Project
+          Value: CodeNexusAI
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ------------------------------------------------------------------
+  # Security groups
+  # ------------------------------------------------------------------
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTP to Web Gateway on port 9000.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP access to Web Gateway
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS to Gemini/Groq APIs, ECR, CloudWatch, SSM
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-sg"
+        - Key: Project
+          Value: CodeNexusAI
+
+  MCPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MCP Core Engine reachable only from localhost within the task.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 127.0.0.1/32
+          Description: MCP reachable only via loopback from the co-located web container
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS (not normally used by MCP, kept for consistency)
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mcp-sg"
+        - Key: Project
+          Value: CodeNexusAI
+
+  # ------------------------------------------------------------------
+  # ECR repositories
+  # ------------------------------------------------------------------
+  ECRRepositoryWeb:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/web-gateway"
+      ImageTagMutability: MUTABLE
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+  ECRRepositoryMCP:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}/mcp-core"
+      ImageTagMutability: MUTABLE
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+  # ------------------------------------------------------------------
+  # CloudWatch log group
+  # ------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${EnvironmentName}/codenexus"
+      RetentionInDays: 7
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+  # ------------------------------------------------------------------
+  # IAM: task execution role (ECR pull, CloudWatch logs, SSM read)
+  # ------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ecs-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SSMSecretRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GeminiApiKeyParameterName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GroqApiKeyParameterName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CodemexusApiKeyParameterName}"
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+  # ------------------------------------------------------------------
+  # ECS Cluster
+  # ------------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${EnvironmentName}-cluster"
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+
+  # ------------------------------------------------------------------
+  # ECS Task Definition (single task, two containers, ARM64)
+  # ------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-task"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      ContainerDefinitions:
+        - Name: web-gateway
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/web-gateway:${ContainerImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 9000
+              HostPort: 9000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: web-gateway
+              awslogs-region: !Ref "AWS::Region"
+          HealthCheck:
+            Command:
+              - "CMD-SHELL"
+              - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health').read()\" || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          Environment:
+            - Name: MCP_BASE
+              Value: http://127.0.0.1:8000
+            - Name: MCP_TIMEOUT
+              Value: "5.0"
+            - Name: QUARANTINE_PATH
+              Value: /app/logs/quarantine.jsonl
+            - Name: LLM_STUB
+              Value: !Ref LLMStub
+            - Name: LLM_ENABLED
+              Value: !Ref LLMEnabled
+            - Name: REDIS_HOST
+              Value: ""
+            - Name: REDIS_PORT
+              Value: ""
+            - Name: AI_MAX_REQUESTS_PER_SESSION
+              Value: !Ref AIMaxRequestsPerSession
+            - Name: AI_MAX_ESTIMATED_COST_PER_SESSION
+              Value: !Ref AIMaxEstimatedCostPerSession
+            - Name: AI_MAX_TOKENS_PER_REQUEST
+              Value: !Ref AIMaxTokensPerRequest
+            - Name: AI_USAGE_LIMIT_ENABLED
+              Value: !Ref AIUsageLimitEnabled
+            - Name: GEMINI_MODEL
+              Value: gemini-3.6-flash
+            - Name: GROQ_MODEL
+              Value: openai/gpt-oss-120b
+          Secrets:
+            - Name: GEMINI_API_KEY
+              ValueFrom: !Ref GeminiApiKeyParameterName
+            - Name: GROQ_API_KEY
+              ValueFrom: !Ref GroqApiKeyParameterName
+            - Name: CODENEXUS_API_KEY
+              ValueFrom: !Ref CodemexusApiKeyParameterName
+        - Name: mcp-core
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/mcp-core:${ContainerImageTag}"
+          Essential: false
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: mcp-core
+              awslogs-region: !Ref "AWS::Region"
+          HealthCheck:
+            Command:
+              - "CMD-SHELL"
+              - "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\" || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          Environment:
+            - Name: MCP_BASE
+              Value: http://127.0.0.1:8000
+
+  # ------------------------------------------------------------------
+  # ECS Service (web gateway exposed; MCP is a co-located sidecar)
+  # ------------------------------------------------------------------
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      ServiceName: !Sub "${EnvironmentName}-service"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet
+          SecurityGroups:
+            - !Ref WebSecurityGroup
+          AssignPublicIp: ENABLED
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Project
+          Value: CodeNexusAI
+
+Outputs:
+  ClusterName:
+    Description: ECS cluster name
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${EnvironmentName}-cluster-name"
+  ServiceName:
+    Description: ECS service name
+    Value: !Ref Service
+  TaskDefinitionArn:
+    Description: ECS task definition ARN
+    Value: !Ref TaskDefinition
+  LogGroupName:
+    Description: CloudWatch log group
+    Value: !Ref LogGroup
+  WebRepositoryUri:
+    Description: ECR repository URI for the web-gateway image
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/web-gateway"
+  MCPRepositoryUri:
+    Description: ECR repository URI for the mcp-core image
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvironmentName}/mcp-core"
+
