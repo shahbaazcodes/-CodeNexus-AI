@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import os
 import sys
 import time
@@ -22,6 +24,7 @@ os.environ.setdefault("REDIS_HOST", "127.0.0.1")
 os.environ.setdefault("REDIS_PORT", "6379")
 
 import agents  # noqa: E402
+from usage_meter import usage_meter  # noqa: E402  (usage metering & cost guard)
 
 
 class _FakeResponse:
@@ -148,6 +151,13 @@ def _reset_global_llm_state(monkeypatch):
         monkeypatch.setattr(limiter, name, value)
     monkeypatch.setattr(breaker, "stats", dict(breaker_stats))
     monkeypatch.setattr(limiter, "stats", dict(limiter_stats))
+    usage_meter.reset()
+    # Reset usage-meter limits to permissive defaults so they cannot leak
+    # between tests and block requests in tests that expect live LLM calls.
+    usage_meter.max_requests_per_session = None
+    usage_meter.max_estimated_cost_per_session = None
+    usage_meter.max_tokens_per_request = None
+    usage_meter.enabled = True
     yield
 
 
@@ -566,6 +576,290 @@ def test_stub_mode_no_external_calls(monkeypatch, fake_client):
     result = asyncio.run(agents.call_llm("review this code", "python"))
     assert "Stub Mode" in result
     assert fake_client.calls == [], "stub mode must not call the network"
+
+
+# ── Cache-key helpers ──
+def _expected_cache_key(agent: str, language: str, prompt: str) -> str:
+    """Replicate the cache-key construction in agents.call_llm."""
+    routing_fingerprint = agents._routing_config_fingerprint()
+    content_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    return f"codenexus:cache:{agent}:{language}:{routing_fingerprint}:{content_hash}"
+
+
+# ── Redis cache correctness tests ──
+def test_identical_inputs_produce_same_cache_key():
+    key1 = _expected_cache_key("reviewer", "python", "review this code")
+    key2 = _expected_cache_key("reviewer", "python", "review this code")
+    assert key1 == key2
+
+
+def test_different_source_produces_different_cache_key():
+    key1 = _expected_cache_key("reviewer", "python", "review this code")
+    key2 = _expected_cache_key("reviewer", "python", "review different code")
+    assert key1 != key2
+
+
+def test_different_language_produces_different_cache_key():
+    key1 = _expected_cache_key("reviewer", "python", "review this code")
+    key2 = _expected_cache_key("reviewer", "javascript", "review this code")
+    assert key1 != key2
+
+
+def test_different_agent_produces_different_cache_key():
+    key1 = _expected_cache_key("reviewer", "python", "review this code")
+    key2 = _expected_cache_key("bug_hunter", "python", "review this code")
+    assert key1 != key2
+
+
+def test_different_routing_config_produces_different_cache_key(monkeypatch):
+    key_default = _expected_cache_key("reviewer", "python", "review this code")
+    monkeypatch.setattr(agents, "PRIMARY_MODEL", "gemini-2.0-flash")
+    key_changed = _expected_cache_key("reviewer", "python", "review this code")
+    assert key_default != key_changed
+
+
+def test_successful_response_cached_with_ttl(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    fake_client.responses = [_make_gemini_response("cached gemini response")]
+    result = asyncio.run(
+        agents.call_llm("review this code", "python", agent="reviewer")
+    )
+    assert result == "cached gemini response"
+    assert len(calls["setex"]) == 1
+    key, ttl, value = calls["setex"][0]
+    assert ttl == 86400, "existing 24-hour TTL must be preserved"
+    assert key == _expected_cache_key("reviewer", "python", "review this code")
+    payload = json.loads(value) if isinstance(value, str) else value
+    assert payload["response"] == "cached gemini response"
+    assert payload["provider_provenance"]["provider"] == "gemini"
+
+
+def test_failed_response_not_cached(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(
+        monkeypatch, enabled=True, stub=False, gemini_key="", groq_key=""
+    )
+    fake, calls = fake_redis
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    assert "Unavailable" in result
+    assert calls["setex"] == [], "failed/unavailable results must not be cached"
+
+
+def test_redis_get_failure_does_not_crash(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake_client.responses = [_make_gemini_response("after redis get failure")]
+
+    def boom_get(key):
+        raise RuntimeError("redis get down")
+
+    fake_redis[0].get = boom_get
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    assert result == "after redis get failure"
+
+
+def test_redis_set_failure_does_not_crash(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake_client.responses = [_make_gemini_response("after redis set failure")]
+
+    def boom_setex(key, ttl, value):
+        raise RuntimeError("redis set down")
+
+    fake_redis[0].setex = boom_setex
+    result = asyncio.run(agents.call_llm("review this code", "python"))
+    assert result == "after redis set failure"
+
+
+def test_cache_hit_returns_without_llm_call(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key = _expected_cache_key("reviewer", "python", "review this code")
+    payload = json.dumps(
+        {
+            "response": "cached answer",
+            "provider_provenance": {"provider": "gemini", "model": "gemini-3.6-flash"},
+        }
+    )
+    fake.setex(key, 86400, payload)
+    result = asyncio.run(
+        agents.call_llm("review this code", "python", agent="reviewer")
+    )
+    assert result == "cached answer"
+    assert fake_client.calls == [], "LLM must not be called on a cache hit"
+    assert calls["get"], "cache get must be attempted on lookup"
+
+
+def test_prompt_change_produces_cache_miss(monkeypatch, fake_client, fake_redis):
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key_a = _expected_cache_key("reviewer", "python", "prompt A")
+    fake.setex(key_a, 86400, json.dumps({"response": "cached A", "provider_provenance": {}}))
+
+    # Prompt A is a cache hit.
+    result_a = asyncio.run(agents.call_llm("prompt A", "python", agent="reviewer"))
+    assert result_a == "cached A"
+
+    # Prompt B is a different rendered prompt -> cache miss -> LLM called.
+    fake_client.responses = [_make_gemini_response("fresh B")]
+    result_b = asyncio.run(agents.call_llm("prompt B", "python", agent="reviewer"))
+    assert result_b == "fresh B"
+    assert len(fake_client.calls) == 1, "LLM must be called on a cache miss"
+
+
+# ── Production cache-key correctness via agents.call_llm() ──
+def test_same_prompt_agent_different_language_does_not_share(monkeypatch, fake_client, fake_redis):
+    """Python vs JavaScript with same prompt/agent must not share a cache entry."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+
+    fake_client.responses = [_make_gemini_response("py result")]
+    result_py = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_py == "py result"
+
+    fake_client.responses = [_make_gemini_response("js result")]
+    result_js = asyncio.run(agents.call_llm("review this code", "javascript", agent="reviewer"))
+    assert result_js == "js result"
+
+    assert len(calls["get"]) == 2, "each language must perform its own cache lookup"
+    assert len(calls["setex"]) == 2, "each language must store its own cache entry"
+    py_keys = [k for k, _, _ in calls["setex"] if ":python:" in k]
+    js_keys = [k for k, _, _ in calls["setex"] if ":javascript:" in k]
+    assert py_keys and js_keys, "expected keys for both languages"
+    assert set(py_keys).isdisjoint(js_keys), "python and javascript must not share a cache entry"
+
+
+def test_different_agents_do_not_share_cache_entry(monkeypatch, fake_client, fake_redis):
+    """Same prompt/language but different agents must not share a cache entry."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+
+    fake_client.responses = [_make_gemini_response("reviewer result")]
+    result_r = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_r == "reviewer result"
+
+    fake_client.responses = [_make_gemini_response("bug_hunter result")]
+    result_b = asyncio.run(agents.call_llm("review this code", "python", agent="bug_hunter"))
+    assert result_b == "bug_hunter result"
+
+    reviewer_keys = [k for k, _, _ in calls["setex"] if ":reviewer:" in k]
+    bug_hunter_keys = [k for k, _, _ in calls["setex"] if ":bug_hunter:" in k]
+    assert reviewer_keys and bug_hunter_keys
+    assert set(reviewer_keys).isdisjoint(bug_hunter_keys), "agents must not share cache entries"
+
+
+def test_changing_primary_model_invalidates_cache_entry(monkeypatch, fake_client, fake_redis):
+    """Changing PRIMARY_MODEL must invalidate the old cache entry."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+
+    key_before = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key_before, 86400, json.dumps({"response": "old model result", "provider_provenance": {}}))
+
+    # Old model -> cache hit, no LLM call.
+    fake_client.responses = []
+    result_old = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_old == "old model result"
+    assert fake_client.calls == [], "no LLM call on cache hit with old model"
+
+    # Switch primary model -> old entry must not match; LLM called.
+    monkeypatch.setattr(agents, "PRIMARY_MODEL", "gemini-2.0-flash")
+    fake_client.responses = [_make_gemini_response("new model result")]
+    result_new = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_new == "new model result"
+    assert len(fake_client.calls) == 1, "LLM must be called after primary model change"
+
+
+def test_changing_groq_model_invalidates_cache_entry(monkeypatch, fake_client, fake_redis):
+    """Changing GROQ_MODEL must invalidate the old cache entry."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+
+    key_before = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key_before, 86400, json.dumps({"response": "old groq result", "provider_provenance": {}}))
+
+    fake_client.responses = []
+    result_old = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_old == "old groq result"
+    assert fake_client.calls == [], "no LLM call on cache hit with old groq model"
+
+    monkeypatch.setattr(agents, "GROQ_MODEL", "openai/gpt-oss-20b")
+    fake_client.responses = [_make_gemini_response("new groq result")]
+    result_new = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result_new == "new groq result"
+    assert len(fake_client.calls) == 1, "LLM must be called after groq model change"
+
+
+def test_changing_prompt_content_invalidates_cache_entry(monkeypatch, fake_client, fake_redis):
+    """Changing prompt content must invalidate the old cache entry."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+
+    key_a = _expected_cache_key("reviewer", "python", "prompt A")
+    fake.setex(key_a, 86400, json.dumps({"response": "cached A", "provider_provenance": {}}))
+
+    result_a = asyncio.run(agents.call_llm("prompt A", "python", agent="reviewer"))
+    assert result_a == "cached A"
+    assert fake_client.calls == [], "no LLM call on cache hit"
+
+    # Different prompt content -> cache miss -> LLM called.
+    fake_client.responses = [_make_gemini_response("fresh B")]
+    result_b = asyncio.run(agents.call_llm("prompt B", "python", agent="reviewer"))
+    assert result_b == "fresh B"
+    assert len(fake_client.calls) == 1, "LLM must be called when prompt content changes"
+
+
+# ── Safe cache-miss handling for malformed / invalid payloads ──
+def test_malformed_cache_payload_causes_safe_miss(monkeypatch, fake_client, fake_redis):
+    """Malformed JSON in cache must not crash; treated as a cache miss."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key, 86400, "{not valid json")
+
+    fake_client.responses = [_make_gemini_response("fresh result")]
+    result = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result == "fresh result"
+    assert len(fake_client.calls) == 1, "LLM must be called on malformed cache payload"
+
+
+def test_cache_payload_without_response_causes_safe_miss(monkeypatch, fake_client, fake_redis):
+    """A cache payload lacking a valid 'response' string must not be returned as a hit."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key, 86400, json.dumps({"provider_provenance": {}}))
+
+    fake_client.responses = [_make_gemini_response("fresh result")]
+    result = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result == "fresh result"
+    assert len(fake_client.calls) == 1, "LLM must be called when response is missing"
+
+
+def test_cache_payload_with_empty_response_causes_safe_miss(monkeypatch, fake_client, fake_redis):
+    """A cache payload with an empty response string must not be returned as a hit."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key, 86400, json.dumps({"response": "", "provider_provenance": {}}))
+
+    fake_client.responses = [_make_gemini_response("fresh result")]
+    result = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result == "fresh result"
+    assert len(fake_client.calls) == 1, "LLM must be called when response is empty"
+
+
+def test_non_dict_cache_payload_causes_safe_miss(monkeypatch, fake_client, fake_redis):
+    """A non-dict cache payload (e.g. a bare string) must not be returned as a hit."""
+    _set_llm_mode(monkeypatch, enabled=True, stub=False)
+    fake, calls = fake_redis
+    key = _expected_cache_key("reviewer", "python", "review this code")
+    fake.setex(key, 86400, "just a string")
+
+    fake_client.responses = [_make_gemini_response("fresh result")]
+    result = asyncio.run(agents.call_llm("review this code", "python", agent="reviewer"))
+    assert result == "fresh result"
+    assert len(fake_client.calls) == 1, "LLM must be called on non-dict cache payload"
+
+
 @pytest.fixture
 def monkeypatch_cb(monkeypatch):
     return monkeypatch
