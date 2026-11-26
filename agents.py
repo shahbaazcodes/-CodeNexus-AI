@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import hashlib
 import time
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 from pathlib import Path
 from typing import Optional, TypedDict, Dict, Any, Tuple
 from langgraph.graph import StateGraph, END
+
+from usage_meter import usage_meter  # noqa: E402  (usage metering & cost guard)
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
@@ -26,6 +29,36 @@ LLM_STUB = os.getenv("LLM_STUB", "0").lower() == "1"
 # Model names configurable through environment variables
 PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+
+def _routing_config_fingerprint() -> str:
+    """Deterministic fingerprint of the configured routing configuration.
+
+    Includes provider/model identities plus output-affecting generation
+    settings that are not represented in the rendered prompt, so any change
+    that could alter the generated output invalidates prior cache entries.
+
+    The actual provider used is unknown at initial cache-lookup time, so the
+    lookup key must not depend on it. Instead we fingerprint the configured
+    primary and fallback provider/model identities plus the generation
+    settings each provider uses.
+
+    Returns a full SHA-256 hex digest (64 characters).
+    """
+    routing_config = {
+        "primary_provider": "gemini",
+        "primary_model": PRIMARY_MODEL,
+        "fallback_provider": "groq",
+        "fallback_model": GROQ_MODEL,
+        # Output-affecting generation settings not present in the rendered
+        # prompt. Included so a change to them invalidates the cache.
+        "gemini_max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+        "groq_temperature": 0.2,
+        "groq_max_tokens": 2048,
+    }
+    payload = json.dumps(routing_config, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
 
 # Bounded retry configuration with exponential backoff
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
@@ -371,7 +404,13 @@ class AgentState(TypedDict):
     refactored: str
     docs: str
 
-async def call_groq(prompt: str, agent: str = "agent") -> Optional[str]:
+async def call_groq(prompt: str, agent: str = "agent") -> Optional[tuple]:
+    """Call Groq fallback. Returns (response_text, usage_dict) or None.
+
+    usage_dict captures provider-reported usage when available:
+      {"input_tokens": int, "output_tokens": int, "total_tokens": int}
+    Missing fields are reported as None rather than invented.
+    """
     if not GROQ_API_KEY:
         return None
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -395,8 +434,16 @@ async def call_groq(prompt: str, agent: str = "agent") -> Optional[str]:
             async with httpx.AsyncClient(timeout=GROQ_TIMEOUT) as client:
                 r = await client.post(url, headers=headers, json=payload)
                 if r.status_code == 200:
+                    data = r.json()
+                    content = data["choices"][0]["message"]["content"]
+                    usage = data.get("usage", {}) or {}
+                    usage_dict = {
+                        "input_tokens": usage.get("prompt_tokens"),
+                        "output_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                    }
                     print(f"⚡ [Groq Success] GPT OSS 120B response generated!")
-                    return r.json()["choices"][0]["message"]["content"]
+                    return content, usage_dict
                 elif _is_retryable_http_status(r.status_code):
                     if attempt < GROQ_MAX_RETRIES - 1:
                         print(f"⚠️ [Groq Retry] HTTP {r.status_code} on attempt {attempt + 1}/{GROQ_MAX_RETRIES}, retrying in {backoff:.1f}s...")
@@ -492,7 +539,17 @@ async def call_gemini_raw(prompt: str, agent: str = "agent") -> Optional[str]:
                         res = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
                         usage = data.get("usageMetadata", {})
                         out_tok = usage.get("outputTokenCount") or estimate_tokens(res)
+                        in_tok = usage.get("inputTokenCount") or estimate_tokens(prompt)
                         quota_limiter.record_output_tokens(out_tok)
+                        # Record Gemini usage via the usage meter (cost guard).
+                        # Provider-reported values only; missing values are recorded
+                        # as 0 (unavailable) rather than estimated.
+                        usage_meter.record_usage(
+                            provider="gemini",
+                            model=PRIMARY_MODEL,
+                            input_tokens=usage.get("inputTokenCount") or 0,
+                            output_tokens=usage.get("outputTokenCount") or 0,
+                        )
                         if res.strip():
                             await gemini_circuit_breaker.reset()
                             quota_limiter.stats["provider_gemini"] += 1
@@ -603,28 +660,80 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
     if not LLM_ENABLED:
         return _unavailable_result(prompt, language, "LLM_DISABLED")
 
+    # ── Usage limit enforcement (token cost guard) ─────────────────────
+    # Reject *all* live AI requests when a configured limit is reached,
+    # before contacting any provider. This prevents the Groq fallback from
+    # silently bypassing the limit. Estimated input tokens for the pending
+    # request are used for the per-request token check.
+    est_input_tokens = estimate_tokens(prompt)
+    limit_reason = usage_meter.check_limits(
+        estimated_input_tokens=est_input_tokens,
+        estimated_output_tokens=0,
+    )
+    if limit_reason is not None:
+        print(f"🚫 [Usage Guard] {agent}: live AI request rejected ({limit_reason})")
+        return _unavailable_result(
+            prompt,
+            language,
+            f"USAGE_LIMIT_REACHED:{limit_reason}",
+        )
+
+    # ── Concurrency reservation ───────────────────────────────────────
+    # Reserve a slot before contacting any provider to ensure concurrent
+    # agent calls cannot bypass request or estimated-cost limits.
+    # The reservation is finalized via commit() after a successful provider
+    # call, or released via release() if the call fails.
+    await usage_meter.reserve(est_input_tokens, 0)
+
     # ── Performance instrumentation ──────────────────────────────
     start = time.perf_counter()
     cache_hit = False
     provider_used = None
     gemini_duration = 0.0
     groq_duration = 0.0
+    res = None
 
     # 1. Check Redis Cache
-    content_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
-    cache_key = f"codenexus:cache:{agent}:{PRIMARY_MODEL}:{content_hash}"
+    # Cache key includes: agent (isolation), language, full SHA-256 of the
+    # rendered prompt (prompt changes invalidate old entries), and a
+    # routing-configuration fingerprint (isolation between different
+    # primary/fallback provider/model configurations). The actual provider
+    # used is intentionally excluded from the lookup key because it is unknown
+    # until after Gemini/Groq routing is resolved.
+    content_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    routing_fingerprint = _routing_config_fingerprint()
+    cache_key = (
+        f"codenexus:cache:{agent}:{language}:{routing_fingerprint}:{content_hash}"
+    )
 
     if REDIS_AVAILABLE:
         try:
             cached_val = redis_client.get(cache_key)
             if cached_val:
-                cache_hit = True
-                print(f"⚡ [Redis Hit] Hash {content_hash[:8]}... served instantly.")
-                total_ms = (time.perf_counter() - start) * 1000
-                print(
-                    f"[Performance] {agent}: {total_ms:.0f} ms (cached, cache_hit=True)"
-                )
-                return cached_val
+                try:
+                    cached_payload = json.loads(cached_val)
+                except (json.JSONDecodeError, TypeError):
+                    # Malformed or unexpected payload -> safe cache miss.
+                    cached_payload = None
+                if (
+                    isinstance(cached_payload, dict)
+                    and isinstance(cached_payload.get("response"), str)
+                    and cached_payload["response"]
+                ):
+                    cache_hit = True
+                    provenance = cached_payload.get("provider_provenance", {})
+                    if not isinstance(provenance, dict):
+                        provenance = {}
+                    print(
+                        f"⚡ [Redis Hit] Hash {content_hash[:8]}... served instantly. "
+                        f"served_by={provenance.get('provider','?')}/{provenance.get('model','?')}"
+                    )
+                    total_ms = (time.perf_counter() - start) * 1000
+                    print(
+                        f"[Performance] {agent}: {total_ms:.0f} ms (cached, cache_hit=True)"
+                    )
+                    return cached_payload["response"]
+                # Missing/invalid response or non-dict payload -> safe cache miss.
         except Exception:
             pass
 
@@ -640,22 +749,41 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
         res = await call_gemini_raw(prompt, agent=agent)
         gemini_duration = time.perf_counter() - g_start
         if res:
+            await usage_meter.commit()
             provider_used = "gemini"
         else:
             # 3. Fallback to Groq API if Gemini fails
             print("🔄 [Failover] Gemini unavailable! Calling Groq...")
             q_start = time.perf_counter()
-            res = await call_groq(prompt, agent=agent)
+            groq_result = await call_groq(prompt, agent=agent)
             groq_duration = time.perf_counter() - q_start
-            if res:
+            if groq_result:
+                res, groq_usage = groq_result
+                # Record Groq usage via the usage meter (cost guard).
+                # Provider-reported values only; missing values recorded as 0.
+                usage_meter.record_usage(
+                    provider="groq",
+                    model=GROQ_MODEL,
+                    input_tokens=groq_usage.get("input_tokens") or 0,
+                    output_tokens=groq_usage.get("output_tokens") or 0,
+                )
+                await usage_meter.commit()
                 provider_used = "groq"
     else:
         # Circuit is open and cooldown not elapsed; go directly to Groq
         print("🔄 [Failover] Gemini circuit OPEN and cooldown not elapsed, skipping Gemini and calling Groq...")
         q_start = time.perf_counter()
-        res = await call_groq(prompt, agent=agent)
+        groq_result = await call_groq(prompt, agent=agent)
         groq_duration = time.perf_counter() - q_start
-        if res:
+        if groq_result:
+            res, groq_usage = groq_result
+            usage_meter.record_usage(
+                provider="groq",
+                model=GROQ_MODEL,
+                input_tokens=groq_usage.get("input_tokens") or 0,
+                output_tokens=groq_usage.get("output_tokens") or 0,
+            )
+            await usage_meter.commit()
             provider_used = "groq"
 
     # 4. If all providers fail or LLM disabled, return honest unavailable result
@@ -666,12 +794,28 @@ async def call_llm(prompt: str, language: str = "", agent: str = "agent") -> str
             f"[Performance] {agent}: {total_ms:.0f} ms (unavailable, "
             f"gemini={gemini_duration:.2f}s, groq={groq_duration:.2f}s)"
         )
+        await usage_meter.release()
         return _unavailable_result(prompt, language, "PROVIDERS_FAILED")
 
-    # Cache only successful provider responses
+    # Cache only successful provider responses. Store provider/model provenance
+    # alongside the cached response so cache hits can report which provider
+    # produced the value without leaking the actual provider into the lookup key.
     if REDIS_AVAILABLE:
         try:
-            redis_client.setex(cache_key, 86400, res)
+            cache_payload = json.dumps(
+                {
+                    "response": res,
+                    "provider_provenance": {
+                        "provider": provider_used,
+                        "model": (
+                            PRIMARY_MODEL if provider_used == "gemini" else GROQ_MODEL
+                        )
+                        if provider_used
+                        else None,
+                    },
+                }
+            )
+            redis_client.setex(cache_key, 86400, cache_payload)
         except Exception:
             pass
 
@@ -700,7 +844,15 @@ def _unavailable_result(prompt: str, language: str, reason: str) -> str:
         "LLM_DISABLED": "LLM analysis disabled via LLM_ENABLED=0",
         "PROVIDERS_FAILED": "All LLM providers failed or returned errors",
     }
-    reason_text = reason_map.get(reason, reason)
+    # Usage-limit rejections carry a reason suffix (e.g. USAGE_LIMIT_REACHED:max_requests_per_session).
+    if reason.startswith("USAGE_LIMIT_REACHED:"):
+        reason_text = (
+            "AI usage limit reached. Further live AI requests are blocked "
+            "to protect API quotas during this demo deployment. "
+            f"Limit: {reason.split(':', 1)[1].replace('_', ' ')}."
+        )
+    else:
+        reason_text = reason_map.get(reason, reason)
 
     return (
         f"### ⚠️ {section} Unavailable ({lang})\n\n"
