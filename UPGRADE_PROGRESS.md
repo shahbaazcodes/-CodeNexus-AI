@@ -561,3 +561,32 @@ All Phase 4 gateway hardening objectives implemented and verified with 25/25 tot
 **Report Generation**
 - Machine-readable JSON report with: evaluation mode, base URL, timestamp, total cases, per-case results, precision/recall/F1 scores, TP/FP/FN counts, language and category breakdowns, metric definitions and limitations
 - Human-readable Markdown summary with: evaluation mode, base URL, dataset language/category breakdowns, results summary, per-case results table, metric definitions, known limitations
+
+---
+## Phase 8 — Documentation & Portfolio Readiness
+
+### Objectives
+1. Define Phase 8 objectives and acceptance criteria in this document (`UPGRADE_PROGRESS.md`).
+2. Professionally overhaul `README.md` so it is understandable to recruiters and technical interviewers.
+3. Document the architecture and four-agent workflow accurately from the actual graph implementation.
+4. Add Web Gateway and MCP API endpoint references with accurate request examples.
+5. Document installation, local execution, Docker execution, and live/stub modes.
+6. Document testing instructions and the verified 83-test result, subject to rerunning tests.
+7. Add honest limitations and known issues.
+8. Add a portfolio demo/screenshots section using existing assets only unless approval is requested.
+9. Create `INTERVIEW.md` with technical talking points and honest project explanations.
+
+### Acceptance Criteria
+- README is understandable to recruiters and technical interviewers.
+- All documented endpoints and request examples match the actual source code.
+- Setup and Docker instructions are accurate.
+- Test instructions and results are documented honestly (verified: 83/83 tests pass).
+- Model routing and fallback limitations are transparent (Gemini primary → Groq fallback; stub mode available).
+- Experimental ML components are clearly identified (RandomForest trained on 6 synthetic rows; health score is deterministic).
+- Interview document explains genuine implementation decisions.
+- No secrets or `.env` contents are exposed.
+- No existing application functionality or infrastructure is changed.
+- All pre-existing working-tree changes remain preserved.
+
+### Phase 8 Status
+Status: COMPLETE — `README.md` overhauled and `INTERVIEW.md` created. All 83 tests verified passing.
