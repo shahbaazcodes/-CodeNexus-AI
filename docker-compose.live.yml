@@ -1,0 +1,25 @@
+# docker-compose.live.yml — CodeNexus AI Live AI deployment override.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.live.yml up -d --build
+#
+# This overlay switches the Web Gateway from offline stub mode to live AI mode:
+#   - Disables the LLM stub (LLM_STUB=0).
+#   - Enables live LLM calls (LLM_ENABLED=1).
+#   - Supplies Gemini (primary, gemini-3.6-flash) and Groq (fallback,
+#     openai/gpt-oss-120b) API keys through secure environment variable
+#     references. Values must be provided in the shell environment or a .env
+#     file; they are never hardcoded here and never copied into images.
+#
+# Redis (redis:7-alpine) is already defined in docker-compose.yml and is
+# reused unchanged in live mode.
+
+services:
+  web-server:
+    environment:
+      - LLM_STUB=0
+      - LLM_ENABLED=1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY is required for live mode}
+      - GROQ_API_KEY=${GROQ_API_KEY:?GROQ_API_KEY is required for live mode}
+      - GEMINI_MODEL=gemini-3.6-flash
+      - GROQ_MODEL=openai/gpt-oss-120b

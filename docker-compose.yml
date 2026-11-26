@@ -1,4 +1,15 @@
 services:
+  redis:
+    image: redis:7-alpine
+    # Redis is not exposed to the host; it is reachable only via Compose DNS
+    # as `redis:6379` from the web-server container.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
   mcp-server:
     build:
       context: .
@@ -25,6 +36,9 @@ services:
     environment:
       # Reach MCP through Compose service-name DNS, not 127.0.0.1.
       - MCP_BASE=http://mcp-server:8000
+      # Redis via Compose service-name DNS; not exposed to the host.
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       # Stub mode by default: no live LLM calls, no API keys required.
       - LLM_STUB=1
       - LLM_ENABLED=0
@@ -32,6 +46,8 @@ services:
       - QUARANTINE_PATH=/app/logs/quarantine.jsonl
     depends_on:
       mcp-server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health').read()"]
